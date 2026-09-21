@@ -1,0 +1,17 @@
+// Copy this file to reconfigure.cmds (gitignored) and edit it to whatever
+// sequence of "#..." commands gets the device back to the state you want
+// after `make flash` wipes it - see the Makefile's own comment on `flash`
+// and `reconfigure`, and scripts/reconfigure.sh for exactly how this file
+// gets sent. One command per line; blank lines and "//" comments (like
+// these) are skipped, so this file is safe to copy as-is and edit from.
+
+// A fresh registration, consuming a real code and registering under a new
+// device_id/secret each time:
+#reg,123456,my-device-name
+
+// Once "#nvs" (or a future direct setter) shows you a device_id/secret from
+// an earlier registration and you'd rather reuse it than register again,
+// replace the "#reg" above with whatever restores that state directly.
+
+// Always useful to see the result:
+#stat

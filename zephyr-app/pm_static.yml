@@ -1,0 +1,4 @@
+pkg:
+  address: 0xb1800
+  size: 0x4e800
+  region: flash_primary

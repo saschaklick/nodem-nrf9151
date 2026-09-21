@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(probe-rs download *)",
+      "Bash(make flash *)"
+    ]
+  }
+}

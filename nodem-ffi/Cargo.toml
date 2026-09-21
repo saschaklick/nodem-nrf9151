@@ -1,0 +1,40 @@
+[package]
+name = "nodem-ffi"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Built standalone via:
+#   cargo build --release --target thumbv8m.main-none-eabihf
+# and linked into the Zephyr app via `zephyr_library_import` - see
+# zephyr-app/CMakeLists.txt. Not part of a Cargo workspace with the
+# top-level `cargo run` wrapper crate, since the two build for different
+# targets (this one embedded, the wrapper for the host).
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+# Same feature set already proven to build cleanly as `#![no_std]` in this
+# project's earlier embassy-based firmware - `runtime` nominally implies
+# `std` in nodem-rs's own Cargo.toml, but the crate itself is
+# unconditionally `#![no_std]` with no actual `std::` usage in the runtime
+# module (verified directly against the source), so this isn't a real
+# std dependency.
+nodem-rs = { git = "https://github.com/saschaklick/nodem-rs", features = ["base", "alloc", "runtime"] }
+embedded-alloc = "0.6"
+# `embedded-alloc`'s lock needs a `critical-section` backend; nothing else in
+# this dependency graph provides one (no `cortex-m` dep here), so we
+# implement it ourselves against Zephyr's own `irq_lock`/`irq_unlock` - see
+# lib.rs.
+critical-section = { version = "1.2", features = ["restore-state-u32"] }
+# nodem-rs itself logs via `log::info!`/`log::error!` internally; without a
+# logger installed those calls are silent no-ops. We install one that
+# forwards to `nodem_log_write` (implemented in C, in nodem_task.c) so
+# nodem-rs's own logging reaches the same UART console as everything else.
+log = "0.4"
+
+[patch."https://github.com/saschaklick/virtmach-rs"]
+virtmach = { path = "../../virtmach-rs" }
+
+[profile.release]
+debug = 2

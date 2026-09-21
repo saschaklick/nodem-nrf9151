@@ -1,0 +1,57 @@
+/*
+ * P0.11 (SDA) / P0.12 (SCL) are shared with spi3's default MOSI/MISO
+ * (arduino_spi, enabled by default on this board) - disable it so i2c1 can
+ * claim the same pins for the SSD1306.
+ */
+&spi3 {
+	status = "disabled";
+};
+
+&pinctrl {
+	/* Same underlying SERIAL block as spi3 (both alias reg 0xb000) - SCK
+	 * (P0.13) goes unused, MOSI/MISO (P0.11/P0.12) become SDA/SCL. */
+	i2c3_default: i2c3_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 11)>,
+				<NRF_PSEL(TWIM_SCL, 0, 12)>;
+		};
+	};
+
+	i2c3_sleep: i2c3_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 0, 11)>,
+				<NRF_PSEL(TWIM_SCL, 0, 12)>;
+			low-power-enable;
+		};
+	};
+};
+
+&i2c3 {
+	compatible = "nordic,nrf-twim";
+	status = "okay";
+	pinctrl-0 = <&i2c3_default>;
+	pinctrl-1 = <&i2c3_sleep>;
+	pinctrl-names = "default", "sleep";
+	/* No `ssd1306` child node here - display_task.c talks to the panel
+	 * directly over this bus with its own hand-rolled driver. */
+	clock-frequency = <I2C_BITRATE_FAST>;
+};
+
+/* P0.28 (RX) / P0.29 (TX) - disabled by default on the `_ns` target ("used
+ * by default in TF-M" per the base board dts), otherwise free. Pinctrl and
+ * current-speed (115200) are already set correctly at the common board
+ * level; this just re-enables it. Dedicated to console/log output only
+ * (see log.h/prj.conf) - the `chosen` override below moves it here from
+ * uart0, which is now dedicated to the process_command protocol instead
+ * (see uart_task.c), so log text can never corrupt that protocol's framing
+ * either way. */
+&uart1 {
+	status = "okay";
+};
+
+/ {
+	chosen {
+		zephyr,console = &uart1;
+		zephyr,shell-uart = &uart1;
+	};
+};
