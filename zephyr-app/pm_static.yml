@@ -1,4 +1,4 @@
 pkg:
-  address: 0xb1f80
-  size: 0x4e080
+  address: 0xb1fe0
+  size: 0x4e020
   region: flash_primary
