@@ -43,13 +43,31 @@ int pkg_store_erase(size_t len);
 int pkg_store_write(size_t offset, const uint8_t *buf, size_t len);
 
 /* Direct read-only pointer to the "pkg" partition's raw contents, with its
- * capacity written to `*len`. No separate read call is needed (unlike
- * pkg_store_write()'s erase-then-write dance) because the nRF9151's
- * internal flash is memory-mapped at its own physical address - this is
- * just that address. Bytes beyond whatever a prior pkg_store_write() series
- * actually wrote read back as 0xFF (erased); the caller (nodem-ffi's
- * nodem_load_pkg(), see lib.rs) is responsible for telling real content
- * apart from that via the package format's own header. */
+ * capacity written to `*len`. Safe to read from directly (ordinary loads,
+ * no driver call) because pm_static.yml also declares a "nonsecure_storage"
+ * partition with the exact same address/size as "pkg" - TF-M's
+ * NRF_NS_STORAGE feature (on by default) grants the SPU Non-Secure access
+ * to whichever flash range Partition Manager resolves "nonsecure_storage"
+ * to, and reads that resolution from pm_config.h same as everything else,
+ * so it picks up "pkg"'s exact bounds without either partition needing to
+ * know about the other.
+ *
+ * This wasn't always safe: an earlier version of pkg_store_read() went
+ * through flash_area_read() instead, specifically because a raw pointer
+ * here faulted with a SecureFault once MCUboot entered the picture -
+ * MCUboot's own Non-Secure boundary configuration is scoped to its own
+ * image slots (mcuboot_primary/mcuboot_secondary) and TF-M's default
+ * Non-Secure grant only covers the main app image, neither of which has
+ * any notion of "pkg", tacked on past mcuboot_secondary's end. The
+ * "nonsecure_storage" declaration above is what closes that gap - without
+ * it, go back to flash_area_read() (see pkg_store_write()'s use of it for
+ * the pattern), which routes through TF-M's platform service instead of
+ * depending on the SPU grant directly, at the cost of not being usable for
+ * a direct, zero-copy read the way nodem_load_pkg() (lib.rs) wants.
+ *
+ * Bytes beyond whatever a prior pkg_store_write() series actually wrote
+ * read back as 0xFF (erased); the caller is responsible for telling real
+ * content apart from that via the package format's own header. */
 const uint8_t *pkg_store_data(size_t *len);
 
 #endif /* PKG_STORE_H_ */

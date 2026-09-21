@@ -1,4 +1,105 @@
+# Three partitions pinned (plus "nonsecure_storage", a same-bytes alias
+# over settings_storage+pkg - see its own comment below); everything else
+# (mcuboot_pad, tfm, app, mcuboot_primary/secondary) is left to Partition
+# Manager's normal dynamic placement.
+#
+# mcuboot:
+#   Pinned to exactly 32KB - tight (the actual binary uses ~30.5KB of it,
+#   confirmed via `arm-zephyr-eabi-size` on a real build,  ~1.5KB of slack)
+#   but it fits, and 32KB happens to be a whole SPU flash region
+#   (CONFIG_NRF_TRUSTZONE_FLASH_REGION_SIZE=0x8000 - see the OTA slot note
+#   below), so mcuboot_pad's own required 0x8000-alignment falls right after
+#   it with no padding needed either. An unpinned build leaves this at 48KB
+#   (whatever Partition Manager's default happens to be, not a measured
+#   requirement) plus a further 16KB of pure alignment gap after it - all
+#   32KB of that reclaimed here, given to "pkg" below via settings_storage/
+#   pkg's own sizing (freeing space up here doesn't automatically flow
+#   anywhere - Partition Manager just leaves it as another gap unless
+#   something downstream is resized to claim it, which is what moving
+#   settings_storage/pkg's addresses down by 32KB below does). If MCUboot's
+#   own image ever grows even slightly, this needs to grow with it or the
+#   build fails outright (loudly, not silently) - there's very little room
+#   for that to happen unnoticed given how little slack is left.
+#
+# settings_storage:
+#   Pinned immediately before "pkg" specifically so the two are contiguous
+#   and a single "nonsecure_storage" declaration can cover both - see that
+#   partition's own comment for why. Doubled in size (8KB -> 16KB) same as
+#   before: config_store.c only uses a handful of small keys, so this is
+#   headroom, not a requirement.
+#
+# pkg:
+#   Raw partition for an uploaded nodem-rs binary UI/Media package (*not*
+#   firmware - see src/pkg_store.c and nodem-ffi's control.rs IControlLoader
+#   impl, ported from nodem-esp32's command_listener.rs). Pinned flush
+#   against the *end* of flash - Partition Manager's "complex region" solver
+#   requires whatever's named in this file to leave exactly one contiguous
+#   gap for the region's dynamic partition (app) to resolve into; an address
+#   anywhere in the middle would look like two gaps instead of one, which
+#   the solver rejects outright ("there must be exactly one gap"). Together
+#   with settings_storage immediately before it, sized to claim as much of
+#   flash as possible while still giving both OTA slots their full 320KB
+#   (see mcuboot_primary/secondary below) - found the same way as before:
+#   testing sizes against the resulting build/partitions.yml until
+#   mcuboot_primary/secondary stopped growing to fill the freed space. With
+#   mcuboot pinned down to 32KB, this tiles perfectly against
+#   mcuboot/mcuboot_primary/mcuboot_secondary/settings_storage with zero
+#   bytes left over anywhere in flash - 32KB + 320KB + 320KB + 16KB + 336KB
+#   = 1024KB exactly.
+#
+# mcuboot_primary (and, auto-matched via share_size, mcuboot_secondary):
+#   NOT pinned directly - Partition Manager doesn't support giving a fixed
+#   size to the partition wrapping the region's dynamic partition (app) the
+#   way it does non-dynamic ones like "pkg"/"settings_storage" above (tried;
+#   the solver crashes with a KeyError trying to resolve app's own address
+#   before app itself has been placed). Sized indirectly instead, purely as
+#   a side effect of how much flash "settings_storage" + "pkg" claim
+#   together: whatever's left between mcuboot_pad and settings_storage is
+#   split evenly between mcuboot_primary (tfm+app) and mcuboot_secondary,
+#   which is what lands on 320KB below.
+#
+# nonsecure_storage:
+#   Same combined address/size as "settings_storage" + "pkg" together,
+#   deliberately - a different Partition Manager name for the same physical
+#   bytes, not a second reservation. "nonsecure_storage" is a name TF-M's
+#   build specifically looks for (NRF_NS_STORAGE, on by default - see
+#   nrf/modules/trusted-firmware-m/tfm_boards/common/config.cmake and
+#   .../partition/region_defs.h's NRF_NS_STORAGE_PARTITION_START/SIZE): it
+#   grants the SPU Non-Secure access to whatever flash range this resolves
+#   to, on top of the main app image's own Non-Secure region (which only
+#   covers tfm_nonsecure/app - neither settings_storage nor pkg fall inside
+#   that on their own). TF-M only supports one such region, contiguous, which
+#   is why settings_storage had to move next to pkg rather than staying in
+#   the alignment gap after mcuboot - the two couldn't both be covered
+#   otherwise. Without this: pkg faults immediately (a SecureFault) on any
+#   direct, non-flash_area read attempt (nodem_load_pkg(), via
+#   pkg_store_data() in pkg_store.c); settings_storage doesn't fault (NVS
+#   only ever accesses it through flash_area_read()/write(), which routes
+#   through TF-M's platform service rather than a direct memory-mapped
+#   read) but its actual reads/writes silently fail, which is what
+#   settings_subsys_init()'s "err -45" (EDEADLK, "not a valid NVS store")
+#   and settings_save_one()'s "err -2" (ENOENT, no backend registered) were.
+#
+# 320KB per OTA slot (not the originally-discussed 300KB): the nRF9151's
+# TrustZone/SPU flash security granularity is 32KB
+# (CONFIG_NRF_TRUSTZONE_FLASH_REGION_SIZE=0x8000), and mcuboot_primary
+# contains the actual secure/non-secure (TF-M/app) split, so its size must
+# be a whole multiple of that. 300KB isn't (300KB / 32KB = 9.375) - the two
+# nearest valid sizes are 288KB and 320KB; 320KB was chosen for more
+# headroom over the ~208KB the firmware actually used as of this writing.
+mcuboot:
+  address: 0x0
+  size: 0x8000
+  region: flash_primary
+settings_storage:
+  address: 0xa8000
+  size: 0x4000
+  region: flash_primary
 pkg:
-  address: 0xb1fe0
-  size: 0x4e020
+  address: 0xac000
+  size: 0x54000
+  region: flash_primary
+nonsecure_storage:
+  address: 0xa8000
+  size: 0x58000
   region: flash_primary

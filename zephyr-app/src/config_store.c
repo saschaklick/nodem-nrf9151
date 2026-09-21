@@ -157,6 +157,8 @@ int config_set_str(const char *key, const char *val)
 
 	int err = settings_save_one(full_key, e->value.str, strlen(e->value.str) + 1);
 
+	info(TAG, "settings_save_one('%s') -> %d", full_key, err);
+
 	k_mutex_unlock(&entries_lock);
 	return err;
 }
@@ -194,6 +196,8 @@ int config_set_i32(const char *key, int32_t val)
 	snprintf(full_key, sizeof(full_key), "cfg/i/%s", key);
 
 	int err = settings_save_one(full_key, &val, sizeof(val));
+
+	info(TAG, "settings_save_one('%s') -> %d", full_key, err);
 
 	k_mutex_unlock(&entries_lock);
 	return err;

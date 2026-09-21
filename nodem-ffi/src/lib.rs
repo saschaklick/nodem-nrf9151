@@ -50,7 +50,10 @@ unsafe extern "C" {
 }
 
 // pkg_store.c's raw, memory-mapped read accessor for the "pkg" partition -
-// see nodem_load_pkg() below.
+// see nodem_load_pkg() below. Safe to dereference directly (no driver call,
+// no copy) because pm_static.yml also declares a "nonsecure_storage"
+// partition covering the same address range - see pkg_store_data()'s doc
+// comment in pkg_store.h for how that grants the SPU access this needs.
 unsafe extern "C" {
     fn pkg_store_data(len: *mut usize) -> *const u8;
 }
@@ -136,12 +139,25 @@ pub extern "C" fn nodem_runtime_new(fb_ptr: *mut u8, fb_len: usize, width: u16, 
 }
 
 /// Loads whatever's in the "pkg" flash partition (pkg_store.c) into
-/// `handle`'s `Media`, if it holds a valid nodem-rs package - call once at
-/// boot, right after `nodem_runtime_new`, before the main loop. The
-/// partition is memory-mapped, so this reads it directly rather than
-/// copying it anywhere first; a first-boot device with nothing ever
-/// uploaded there (an erased partition, all 0xFF) is the normal case, not
-/// an error, and is silently skipped once its magic bytes fail to match.
+/// `handle`'s `Media`, if it holds a valid nodem-rs package. Call once at
+/// boot, right after the *first* `nodem_runtime_run()` - not right after
+/// `nodem_runtime_new`, before any render has happened: that first `run()`
+/// is nodem's own initialization (it loads nodem-rs's built-in PKG_SYS as
+/// source 0), and this needs to land after that, not race it. Call again
+/// any time `nodem_control_take_pkg_ready()` returns true, so a
+/// freshly-uploaded package takes effect immediately rather than only on
+/// the next reboot. A first-boot device with nothing ever uploaded there
+/// (an erased partition, all 0xFF) is the normal case, not an error, and is
+/// silently skipped once its magic bytes fail to match.
+///
+/// Points `Media` directly at the "pkg" partition's own memory-mapped
+/// address, no copy - safe because pm_static.yml declares a
+/// "nonsecure_storage" partition covering the same range, which grants the
+/// SPU access this needs (see pkg_store_data()'s doc comment in
+/// pkg_store.h). `Media::load_pkg` stores raw pointers into whatever buffer
+/// it's given, read again at render time, not just while it itself parses -
+/// so this only works because that whole range is genuinely,
+/// permanently Non-Secure, not just for the duration of this one call.
 ///
 /// The package's own 4-byte length field (right after its "PKG0" magic) is
 /// read here, up front, specifically so `Media::load_pkg` is handed a slice
