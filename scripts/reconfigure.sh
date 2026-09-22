@@ -32,10 +32,16 @@ stty -F "$TTY" "$BAUD" raw -echo
 
 # Runs for as long as this script does, printing replies as they arrive
 # rather than only after every command has been sent - each command's
-# result (line_bytes) is a single "<line>\r\n" per the protocol, so this
-# just relays raw bytes rather than trying to line up which reply answers
-# which command.
-cat "$TTY" &
+# result (line_bytes) is a single "<line>\r\n" per the protocol, read here
+# one reply at a time (not a raw `cat` passthrough) so each can be indented
+# 3 spaces - the width of a sent line's " → " prefix - so a reply's text
+# lines up directly under the command that produced it, with no symbol of
+# its own (only sent lines are marked, so an unmarked line is always a
+# reply). `${reply%$'\r'}` strips the trailing \r the protocol always sends,
+# so it doesn't fight the terminal's own \n on the next line.
+while IFS= read -r reply || [ -n "$reply" ]; do
+	printf '   %s\n' "${reply%$'\r'}"
+done < "$TTY" &
 READER_PID=$!
 trap 'kill "$READER_PID" 2>/dev/null || true' EXIT
 
@@ -47,6 +53,7 @@ while IFS= read -r line || [ -n "$line" ]; do
 	//*) continue ;;
 	esac
 
+	printf ' → %s\n' "$line"
 	printf '%s\r\n' "$line" > "$TTY"
 	sleep 0.2
 done < "$CMDS_FILE"

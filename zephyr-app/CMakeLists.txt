@@ -13,7 +13,6 @@ target_sources(app PRIVATE
     src/nodem_listener.c
     src/nodem_task.c
     src/pkg_store.c
-    src/sha1_shim.c
     src/uart_task.c
 )
 

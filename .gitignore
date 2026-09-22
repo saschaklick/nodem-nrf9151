@@ -1,5 +1,6 @@
 Cargo.lock
 /build/
+/build-rtt/
 
 # Holds whatever device-reconfiguration commands you're currently using
 # with `make reconfigure` (see the Makefile and scripts/reconfigure.sh) -

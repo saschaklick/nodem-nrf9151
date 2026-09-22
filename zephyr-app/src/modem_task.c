@@ -11,10 +11,16 @@
 #include <zephyr/net/socket.h>
 #include <zephyr/net/tls_credentials.h>
 #include <zephyr/net/websocket.h>
+/* NCS v3.4.1: <zephyr/net/socket.h> no longer aliases the plain POSIX names
+ * (socket()/connect()/send()/recv()/close()/getaddrinfo()/setsockopt(),
+ * struct addrinfo) even with CONFIG_POSIX_API=y - they now live in these
+ * headers instead (netdb.h #define's addrinfo to zsock_addrinfo). */
+#include <zephyr/posix/netdb.h>
+#include <zephyr/posix/sys/socket.h>
+#include <zephyr/posix/unistd.h>
 
 #include <modem/nrf_modem_lib.h>
 #include <modem/lte_lc.h>
-#include <modem/pdn.h>
 #include <modem/modem_key_mgmt.h>
 #include <nrf_modem_at.h>
 
@@ -151,7 +157,7 @@ size_t modem_ws_write(const uint8_t *buf, size_t len)
 }
 
 /* Tracks the default PDP context (cid 0) brought up as part of
- * lte_lc_connect() - set/cleared by pdn_event_handler(), consumed by
+ * lte_lc_connect() - set/cleared by lte_lc_evt_handler(), consumed by
  * step_pdn_connect() and the post-connect supervisor loop below. */
 static atomic_t g_pdn_up = ATOMIC_INIT(0);
 static K_SEM_DEFINE(pdn_activated_sem, 0, 1);
@@ -162,25 +168,28 @@ static void set_status(enum modem_step step, enum step_state state, int err)
 	atomic_set(&g_status[step].err, err);
 }
 
-static void pdn_event_handler(uint8_t cid, enum pdn_event event, int reason)
+/* Replaces the old pdn.h callback API (pdn_default_ctx_cb_reg()/enum
+ * pdn_event), removed in NCS v3.4.1 - PDN events now arrive as LTE_LC_EVT_PDN
+ * through the same lte_lc event handler as everything else. */
+static void lte_lc_evt_handler(const struct lte_lc_evt *const evt)
 {
-	if (cid != 0) {
+	if (evt->type != LTE_LC_EVT_PDN || evt->pdn.cid != 0) {
 		return;
 	}
 
-	switch (event) {
-	case PDN_EVENT_ACTIVATED:
+	switch (evt->pdn.type) {
+	case LTE_LC_EVT_PDN_ACTIVATED:
 		atomic_set(&g_pdn_up, 1);
 		k_sem_give(&pdn_activated_sem);
 		break;
-	case PDN_EVENT_DEACTIVATED:
-	case PDN_EVENT_NETWORK_DETACH:
-	case PDN_EVENT_CTX_DESTROYED:
+	case LTE_LC_EVT_PDN_DEACTIVATED:
+	case LTE_LC_EVT_PDN_NETWORK_DETACH:
+	case LTE_LC_EVT_PDN_CTX_DESTROYED:
 		atomic_set(&g_pdn_up, 0);
-		warn(TAG, "pdn event %d on default context", event);
+		warn(TAG, "pdn event %d on default context", evt->pdn.type);
 		break;
-	case PDN_EVENT_CNEC_ESM:
-		warn(TAG, "pdn esm error: %s", pdn_esm_strerror(reason));
+	case LTE_LC_EVT_PDN_ESM_ERROR:
+		warn(TAG, "pdn esm error: %s", lte_lc_pdn_esm_strerror(evt->pdn.esm_err));
 		break;
 	default:
 		break;
@@ -271,7 +280,7 @@ static int step_sim_check(void)
 
 /* The modem is already in CFUN=1 by this point (step_sim_check() switched it
  * there to query the SIM), so this just blocks until registered - which
- * also activates the default PDP context (cid 0) - pdn_event_handler()
+ * also activates the default PDP context (cid 0) - lte_lc_evt_handler()
  * reports that activation via g_pdn_up/pdn_activated_sem. */
 static int step_pdn_connect(void)
 {
@@ -794,7 +803,7 @@ static void modem_task(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	pdn_default_ctx_cb_reg(pdn_event_handler);
+	lte_lc_register_handler(lte_lc_evt_handler);
 
 	enum modem_step step = MODEM_STEP_INIT;
 
@@ -835,6 +844,17 @@ static void modem_task(void *p1, void *p2, void *p3)
 			error(TAG, "%s failed, err %d", step_name[step], err);
 			set_status(step, STEP_ERROR, err);
 			k_msleep(MODEM_RETRY_DELAY_MS);
+			/* Unlike every other step, a failed
+			 * step_websocket_connect() always leaves g_tls_fd
+			 * closed and reset to -1 (see its own doc comment) -
+			 * simply retrying MODEM_STEP_WEBSOCKET in place would
+			 * hit that stale -1 immediately (step_websocket_connect
+			 * ()'s own "fd < 0" guard, -ENOTCONN) forever, never
+			 * recovering on its own. Go back through
+			 * MODEM_STEP_TLS first to get a fresh fd instead. */
+			if (step == MODEM_STEP_WEBSOCKET) {
+				step = MODEM_STEP_TLS;
+			}
 			continue;
 		}
 
