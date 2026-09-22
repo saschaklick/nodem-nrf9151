@@ -1,0 +1,43 @@
+#
+# App-specific Kconfig - custom options live here, then "source
+# Kconfig.zephyr" below pulls in the rest of Zephyr's own tree (required
+# boilerplate for any app-level Kconfig root - see
+# nrf/cmake/modules/kconfig.cmake: an app's own Kconfig file, if present,
+# becomes KCONFIG_ROOT wholesale, not an addition to Zephyr's default one).
+#
+
+menu "nodem-nrf9151"
+
+choice APP_LOG_LEVEL
+	prompt "Application log level (log.h's info/warn/error/debug macros)"
+	default APP_LOG_LEVEL_DEBUG
+	help
+	  Each level compiles in itself and everything more severe, same as
+	  the `log` crate's max_level_* features nodem-ffi's Cargo.toml
+	  mirrors this with (see the Makefile's LOG_LEVEL switch) - dropped
+	  levels compile away to nothing (log.h's macros expand to a bare
+	  ((void)0), not a runtime-filtered call), actually shrinking flash
+	  usage rather than just quieting the console.
+
+config APP_LOG_LEVEL_DEBUG
+	bool "Debug and above (debug/info/warn/error)"
+
+config APP_LOG_LEVEL_INFO
+	bool "Info and above (info/warn/error)"
+
+config APP_LOG_LEVEL_WARN
+	bool "Warn and above (warn/error)"
+
+config APP_LOG_LEVEL_ERROR
+	bool "Error only"
+
+config APP_LOG_LEVEL_NONE
+	bool "No logging at all"
+
+endchoice
+
+endmenu
+
+menu "Zephyr Kernel"
+source "Kconfig.zephyr"
+endmenu

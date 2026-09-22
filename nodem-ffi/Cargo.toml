@@ -13,8 +13,34 @@ embedded-alloc = "0.6"
 critical-section = { version = "1.2", features = ["restore-state-u32"] }
 log = "0.4"
 
+# Mirrors zephyr-app's Kconfig APP_LOG_LEVEL choice (log.h) one-to-one, so
+# the Rust side (this crate's own log::info!/error! calls, and nodem-rs's -
+# it uses all four levels internally too) drops the same way as the C side
+# for a given LOG_LEVEL (see the Makefile). log's max_level_* features strip
+# log macro calls entirely at compile time (not just filter them at
+# runtime), matching log.h's macros compiling to nothing rather than just
+# going quiet. No `default` max_level - the Makefile always passes one of
+# these explicitly - so a bare `cargo build` outside the Makefile (e.g. from
+# an editor) intentionally gets the crate's unrestricted default instead of
+# silently picking one of these for you.
+[features]
+log-debug = ["log/max_level_debug"]
+log-info = ["log/max_level_info"]
+log-warn = ["log/max_level_warn"]
+log-error = ["log/max_level_error"]
+log-none = ["log/max_level_off"]
+
 [patch."https://github.com/saschaklick/virtmach-rs"]
 virtmach = { path = "../../virtmach-rs" }
+
+# nodem-rs's own Cargo.toml used to hardcode log = { features =
+# ["max_level_debug"] }, which unconditionally wins Cargo's feature
+# unification for the shared `log` crate and made errors-only/no-logs above
+# impossible to actually apply (log's build script hard-errors on multiple
+# max_level_* features being active at once). Patched to a local checkout
+# with that hardcoded feature removed instead - see its own Cargo.toml.
+[patch."https://github.com/saschaklick/nodem-rs"]
+nodem-rs = { path = "../../nodem-rs" }
 
 [profile.release]
 debug = 2

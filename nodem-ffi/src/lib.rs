@@ -98,13 +98,27 @@ impl log::Log for FfiLogger {
 static mut LOGGER_INITIALIZED: bool = false;
 
 fn ensure_logger() {
+    // Under the "log-none" feature, every log::info!/error! call site is
+    // already gone (log/max_level_off strips them at compile time), but
+    // FfiLogger::log() would otherwise still survive as dead code: taking
+    // &LOGGER as a `&dyn Log` trait object for set_logger() below creates a
+    // vtable reference, which keeps the function reachable for --gc-sections
+    // purposes even though nothing ever actually calls through it. Skipping
+    // the registration entirely here removes that last reference, letting
+    // the linker drop FfiLogger::log() (and its nodem_log_write FFI call)
+    // for real.
+    #[cfg(not(feature = "log-none"))]
     unsafe {
         if !LOGGER_INITIALIZED {
             // `set_logger` only allowed once per process - fine, since
             // `nodem_runtime_new` (the only caller) is itself only ever
-            // called once.
+            // called once. STATIC_MAX_LEVEL, not a hardcoded LevelFilter -
+            // it already reflects whichever log-debug/-info/-warn/-error
+            // Cargo feature is active (see Cargo.toml), so this runtime
+            // filter can never be *more* restrictive than the compile-time
+            // one and silently swallow levels that feature meant to allow.
             let _ = log::set_logger(&LOGGER);
-            log::set_max_level(log::LevelFilter::Info);
+            log::set_max_level(log::STATIC_MAX_LEVEL);
             LOGGER_INITIALIZED = true;
         }
     }

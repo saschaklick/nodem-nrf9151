@@ -4,6 +4,10 @@
 #include <stdbool.h>
 #include <stdio.h>
 
+/* Logs at info() level internally, so its own formatting work (below) is
+ * skipped entirely - not just its output silenced - once the log level
+ * drops below info, same reasoning as log.h's own macros. */
+#if defined(CONFIG_APP_LOG_LEVEL_DEBUG) || defined(CONFIG_APP_LOG_LEVEL_INFO)
 void log_bytes(const char *tag, const char *dir, const uint8_t *buf, size_t len)
 {
 	if (len == 0) {
@@ -43,3 +47,12 @@ void log_bytes(const char *tag, const char *dir, const uint8_t *buf, size_t len)
 	info(tag, "%s [%u] \"%.*s%s\" %s", dir, (unsigned)len, (int)trimmed, buf,
 	     truncated ? "..." : "", hex);
 }
+#else
+void log_bytes(const char *tag, const char *dir, const uint8_t *buf, size_t len)
+{
+	(void)tag;
+	(void)dir;
+	(void)buf;
+	(void)len;
+}
+#endif

@@ -13,11 +13,36 @@
  * overlay's `chosen` override and prj.conf), and the format is
  * fixed/simple enough not to need LOG's runtime filtering, deferred
  * logging, or multiple backends.
+ *
+ * Each macro compiles to a bare ((void)0) once CONFIG_APP_LOG_LEVEL_* (see
+ * zephyr-app/Kconfig, set via the Makefile's LOG_LEVEL switch) drops below
+ * it - a real compile-time removal (format string and all), not just a
+ * runtime-filtered call that still costs flash either way.
  */
-#define info(tag, fmt, ...) printk("[%s] INFO " fmt "\n", tag, ##__VA_ARGS__)
-#define warn(tag, fmt, ...) printk("[%s] WARN " fmt "\n", tag, ##__VA_ARGS__)
-#define error(tag, fmt, ...) printk("[%s] ERROR " fmt "\n", tag, ##__VA_ARGS__)
+#if defined(CONFIG_APP_LOG_LEVEL_DEBUG)
 #define debug(tag, fmt, ...) printk("[%s] DEBUG " fmt "\n", tag, ##__VA_ARGS__)
+#else
+#define debug(tag, fmt, ...) ((void)0)
+#endif
+
+#if defined(CONFIG_APP_LOG_LEVEL_DEBUG) || defined(CONFIG_APP_LOG_LEVEL_INFO)
+#define info(tag, fmt, ...) printk("[%s] INFO " fmt "\n", tag, ##__VA_ARGS__)
+#else
+#define info(tag, fmt, ...) ((void)0)
+#endif
+
+#if defined(CONFIG_APP_LOG_LEVEL_DEBUG) || defined(CONFIG_APP_LOG_LEVEL_INFO) || \
+	defined(CONFIG_APP_LOG_LEVEL_WARN)
+#define warn(tag, fmt, ...) printk("[%s] WARN " fmt "\n", tag, ##__VA_ARGS__)
+#else
+#define warn(tag, fmt, ...) ((void)0)
+#endif
+
+#if !defined(CONFIG_APP_LOG_LEVEL_NONE)
+#define error(tag, fmt, ...) printk("[%s] ERROR " fmt "\n", tag, ##__VA_ARGS__)
+#else
+#define error(tag, fmt, ...) ((void)0)
+#endif
 
 /*
  * Logs a byte buffer as `dir [<length>] "<trimmed ascii>" <hex>` at INFO
