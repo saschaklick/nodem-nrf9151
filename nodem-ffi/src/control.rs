@@ -123,6 +123,22 @@ impl IControl for ZephyrControl {
         _media: &Media,
         res: &mut dyn core::fmt::Write,
     ) -> (bool, core::fmt::Result) {
+        // "page=<idx>" - peeked here, not claimed, purely to persist it as
+        // config_store's "last_page" so nodem_task.c can restore it on the
+        // next boot (see its own doc comment there). Always falls through
+        // afterward: this listener runs before DOM's (see runtime.rs's
+        // process_command - the order is deliberate, for exactly this) so
+        // DOM's own "page=" handler still sees the same line and actually
+        // loads the page, same as if this peek didn't exist.
+        if let Some(value) = line.strip_prefix("page=") {
+            let mut val_buf = [0u8; VAL_BUF_LEN];
+            if let Some(v) = to_cstr(value.trim(), &mut val_buf) {
+                unsafe {
+                    let _ = config_set_str(c"last_page".as_ptr(), v.as_ptr() as *const c_char);
+                }
+            }
+        }
+
         let prefix = "#";
         if !line.starts_with(prefix) {
             return (false, Ok(()));

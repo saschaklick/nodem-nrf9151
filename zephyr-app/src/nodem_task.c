@@ -1,11 +1,13 @@
 #include "nodem_task.h"
 
-#include <string.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/sys/util.h>
 
+#include "config_store.h"
 #include "display_task.h"
 #include "modem_task.h"
 #include "nodem_ffi.h"
@@ -232,6 +234,37 @@ static void nodem_task(void *p1, void *p2, void *p3)
 		if (!pkg_loaded) {
 			pkg_loaded = true;
 			nodem_load_pkg(runtime);
+
+			/* Restores whatever page was last shown before reboot -
+			 * persisted by control.rs's ZephyrControl::process_line()
+			 * peeking at every "page=<idx>" command as it passes
+			 * through (see its own doc comment there). Fed back in as
+			 * a synthetic command through the exact same
+			 * nodem_process_command() path real UART/websocket input
+			 * uses - not a separate code path - so it's handled by
+			 * the same DOM logic a live "page=" would be, right after
+			 * the pkg it belongs to has just been loaded above. Empty
+			 * ("" default) means never persisted (fresh device, or a
+			 * pkg from before this existed) - skip rather than
+			 * sending a malformed "page=" command. The reply text
+			 * goes nowhere (no transport is waiting on this one), so
+			 * it's just discarded. */
+			char last_page[32];
+
+			config_get_str("last_page", last_page, sizeof(last_page), "");
+			if (last_page[0] != '\0') {
+				char cmd[48];
+				int cmd_len = snprintf(cmd, sizeof(cmd), "page=%s\r\n", last_page);
+
+				if (cmd_len > 0 && (size_t)cmd_len < sizeof(cmd)) {
+					uint8_t discard[32];
+					size_t discard_len = 0;
+
+					nodem_process_command(runtime, (const uint8_t *)cmd,
+							       (size_t)cmd_len, discard,
+							       sizeof(discard), &discard_len);
+				}
+			}
 		}
 
 		convert_to_vtiled(nodem_fb, vtiled_fb);
