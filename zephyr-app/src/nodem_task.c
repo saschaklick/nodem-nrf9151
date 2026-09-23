@@ -70,7 +70,14 @@ static void nodem_process_uart(void *runtime)
 {
 	size_t avail = uart_task_read(&cmd_buf[cmd_buf_len], CMD_BUF_SIZE - cmd_buf_len);
 
-	log_bytes(TAG, "rx", &cmd_buf[cmd_buf_len], avail);
+	/* Not while an upload is streaming in - that's binary payload, and
+	 * one log line per chunk would flood the console for the whole
+	 * transfer (and slow it down, printk being synchronous). Replies
+	 * ("tx" below) are still logged - there are only a couple per
+	 * upload. */
+	if (!nodem_loader_active(runtime)) {
+		log_bytes(TAG, "rx", &cmd_buf[cmd_buf_len], avail);
+	}
 
 	cmd_buf_len += avail;
 
@@ -124,7 +131,10 @@ static void nodem_process_ws(void *runtime)
 {
 	size_t avail = modem_ws_read(&ws_cmd_buf[ws_cmd_buf_len], WS_CMD_BUF_SIZE - ws_cmd_buf_len);
 
-	log_bytes(TAG, "ws rx", &ws_cmd_buf[ws_cmd_buf_len], avail);
+	/* See nodem_process_uart()'s note on skipping this during uploads. */
+	if (!nodem_loader_active(runtime)) {
+		log_bytes(TAG, "ws rx", &ws_cmd_buf[ws_cmd_buf_len], avail);
+	}
 
 	ws_cmd_buf_len += avail;
 

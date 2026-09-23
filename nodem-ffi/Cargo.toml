@@ -36,3 +36,11 @@ virtmach = { path = "../../virtmach-rs" }
 
 [profile.release]
 debug = 2
+# The signed app image (TF-M + app) must stay under MCUboot's usable slot
+# size - 0x4E000 bytes, not the full 320KB slot (see the Makefile's
+# OTA_MAX_IMAGE_SIZE) - or MCUboot rejects it at boot with "Image in the
+# primary slot is not valid!" and never starts it. LTO with a single codegen
+# unit trims ~33KB off the Rust side at no speed cost; opt-level = "s" would
+# save another ~27KB if that's ever needed, at the cost of slower rendering.
+lto = true
+codegen-units = 1

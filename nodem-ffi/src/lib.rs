@@ -298,6 +298,17 @@ pub extern "C" fn nodem_status_message_clear(handle: *mut c_void) {
     dom.status_message = None;
 }
 
+/// See nodem_ffi.h's doc comment on `nodem_loader_active`. Uses
+/// get_loader_progress() rather than Control::is_loader_busy(): the latter
+/// also stays true after a failed upload (it doubles as "keep showing the
+/// error on the progress screen"), which would leave callers thinking a
+/// transfer is still running.
+#[unsafe(no_mangle)]
+pub extern "C" fn nodem_loader_active(handle: *mut c_void) -> bool {
+    let dom = unsafe { &*(handle as *const DOM) };
+    dom.control.as_ref().is_some_and(|control| control.get_loader_progress(1).is_some())
+}
+
 /// Feeds one command line into the runtime and writes its text response into
 /// `output_ptr`/`output_cap`, storing the number of bytes written in
 /// `*output_len`. Returns the number of input bytes consumed.

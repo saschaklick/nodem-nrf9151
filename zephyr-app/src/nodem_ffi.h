@@ -43,6 +43,15 @@ bool nodem_status_message_set(void *handle, const uint8_t *text_ptr, size_t text
  * drawn for it from the next frame onward.
  */
 void nodem_status_message_clear(void *handle);
+/*
+ * True while a "pkg"/"ota" upload is streaming through
+ * nodem_process_command() - from the first length byte after the "pkg"/"ota"
+ * line until the last payload byte. nodem_task.c uses it to stop hex-dumping
+ * every received chunk to the console for the length of a (binary,
+ * potentially 300KB) upload.
+ */
+bool nodem_loader_active(void *handle);
+
 size_t nodem_process_command(void *handle, const uint8_t *input_ptr, size_t input_len,
 			      uint8_t *output_ptr, size_t output_cap, size_t *output_len);
 

@@ -249,6 +249,8 @@ impl IControl for ZephyrControl {
                 let status = core::str::from_utf8(&buf[..n]).unwrap_or("");
                 let _ = write!(res, "modem,{status}\r\n");
             }
+            "cfg" => {
+            }
             _ => ret = Ret::Error,
         }
 
