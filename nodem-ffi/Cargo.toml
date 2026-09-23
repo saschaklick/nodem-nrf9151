@@ -24,6 +24,7 @@ log = "0.4"
 # an editor) intentionally gets the crate's unrestricted default instead of
 # silently picking one of these for you.
 [features]
+std = []
 log-debug = ["log/max_level_debug"]
 log-info = ["log/max_level_info"]
 log-warn = ["log/max_level_warn"]
@@ -32,15 +33,6 @@ log-none = ["log/max_level_off"]
 
 [patch."https://github.com/saschaklick/virtmach-rs"]
 virtmach = { path = "../../virtmach-rs" }
-
-# nodem-rs's own Cargo.toml used to hardcode log = { features =
-# ["max_level_debug"] }, which unconditionally wins Cargo's feature
-# unification for the shared `log` crate and made errors-only/no-logs above
-# impossible to actually apply (log's build script hard-errors on multiple
-# max_level_* features being active at once). Patched to a local checkout
-# with that hardcoded feature removed instead - see its own Cargo.toml.
-[patch."https://github.com/saschaklick/nodem-rs"]
-nodem-rs = { path = "../../nodem-rs" }
 
 [profile.release]
 debug = 2
