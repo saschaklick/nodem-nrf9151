@@ -2,7 +2,8 @@ Cargo.lock
 /build/
 /build-rtt/
 /build-ota/
-/ota/
+/nodem_NRF9151.bin
+/nodem_NRF9151-ota.bin
 /nodem-ffi/target/*
 
 # Holds whatever device-reconfiguration commands you're currently using

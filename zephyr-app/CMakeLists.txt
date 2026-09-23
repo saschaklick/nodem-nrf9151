@@ -12,6 +12,7 @@ target_sources(app PRIVATE
     src/modem_task.c
     src/nodem_listener.c
     src/nodem_task.c
+    src/ota_store.c
     src/pkg_store.c
     src/uart_task.c
 )

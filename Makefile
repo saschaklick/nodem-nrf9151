@@ -1,6 +1,9 @@
 # Build and flash the nodem-nrf9151 Zephyr firmware.
 #
-#   make build        - build nodem-ffi (Rust) + the Zephyr app
+#   make build        - build nodem-ffi (Rust) + the Zephyr app, and leave
+#                       the full flash image (mcuboot + TF-M + app, i.e.
+#                       merged.hex as a flat binary starting at 0x0) at
+#                       ./nodem_NRF9151.bin (see FIRMWARE_BIN below)
 #   make flash        - flash the last build, keeping config_store/pkg intact
 #   make flash INIT=1 - same, but mass-erases first (needed once per locked
 #                       or brand-new chip - see its own note)
@@ -54,21 +57,26 @@
 #                       run unattended on a real device rather than one
 #                       being watched live over `logs`: LOG_LEVEL defaults
 #                       to "error" here (not "debug" - see above), though
-#                       it's still the same switch, so `LOG_LEVEL=debug make
-#                       ota` works if a debug-logging OTA build is ever
-#                       actually wanted. The resulting signed binary is
-#                       copied to ota/zephyr.signed.bin (see OTA_OUT_DIR
-#                       below) - a stable path outside west's own
-#                       build-ota/ tree - and its size is reported against
-#                       the 320KB-per-slot budget (pm_static.yml).
+#                       it's still the same switch, so `make ota
+#                       LOG_LEVEL=debug` works if a debug-logging OTA build
+#                       is ever actually wanted - as a make argument only:
+#                       unlike `build`, `ota` ignores LOG_LEVEL set in the
+#                       environment (`LOG_LEVEL=debug make ota` still builds
+#                       at "error"). The resulting signed binary is
+#                       copied to ./nodem_NRF9151-ota.bin (see
+#                       OTA_FIRMWARE_BIN below) - a stable path outside
+#                       west's own build-ota/ tree - and its size is
+#                       reported against OTA_MAX_IMAGE_SIZE (see below -
+#                       less than the full 320KB slot).
 #
 #   make flash-ota SLOT=0|1 (default 1)
 #                     - flashes the last `make ota` build directly into a
 #                       slot over SWD (via nrfutil, like plain `flash`) -
-#                       standing in for the still-unbuilt real OTA delivery
-#                       path (network download + write, see sysbuild.conf's
-#                       note) so the swap/rollback machinery can be
-#                       exercised now, on the bench, without it. Both slots
+#                       bypassing the real OTA delivery path (an "ota"
+#                       upload over the command UART, see nodem-ffi's
+#                       control.rs and zephyr-app/src/ota_store.c) so the
+#                       swap/rollback machinery can be exercised on the
+#                       bench without an uploader. Both slots
 #                       flash the exact same underlying image
 #                       (build-ota/zephyr-app/zephyr/tfm_merged.hex - the
 #                       TF-M+app pair MCUboot swaps as one unit) - only the
@@ -78,8 +86,8 @@
 #                       SLOT=0 - straight into mcuboot_primary_app
 #                       (0x8200): overwrites the currently-running image in
 #                       place, no swap/test/rollback involved at all -
-#                       equivalent to `make flash` but sourced from ota/
-#                       instead of build/. Uses zephyr.signed.hex as-is, no
+#                       equivalent to `make flash` but sourced from
+#                       build-ota/ instead of build/. Uses zephyr.signed.hex as-is, no
 #                       repackaging (it's already addressed there).
 #
 #                       SLOT=1 - into mcuboot_secondary (0x58000, the real
@@ -322,8 +330,10 @@ INIT ?= 0
 # make ota - see the header comment's own note. Own build directory (never
 # BUILD_DIR/BUILD_RTT_DIR) and its own LOG_LEVEL default ("error", not
 # "debug" - $(origin) is what lets the *default* differ from `build`'s
-# while `LOG_LEVEL=... make ota` on the command line still wins either way,
+# while `make ota LOG_LEVEL=...` on the command line still wins either way,
 # same precedence command-line assignments always have over a plain `?=`).
+# Only a command-line value counts: an environment LOG_LEVEL has origin
+# "environment", so `LOG_LEVEL=... make ota` falls back to "error".
 BUILD_OTA_DIR := build-ota
 
 ifeq ($(origin LOG_LEVEL),command line)
@@ -343,6 +353,16 @@ OTA_EXTRA_CONF_ARGS   := $(if $(OTA_LOG_LEVEL_CONF),-- -DEXTRA_CONF_FILE="$(OTA_
 OTA_SLOT_SIZE     := 327680
 OTA_SLOT_SIZE_HEX := 0x50000
 
+# The largest signed image MCUboot will actually boot - less than the slot:
+# in swap-move mode (mcuboot's CONFIG_BOOT_SWAP_USING_MOVE) its
+# app_max_size() reserves one 4KB sector for the swap trailer and another
+# for the sector-by-sector move itself, and image validation rejects
+# anything reaching past that ("Image in the primary slot is not valid!"),
+# primary slot included - an oversized image doesn't just fail to OTA, it
+# stops the board booting at all. `build` refuses to finish (for every
+# variant: plain, LOG=rtt, ota) rather than let such an image be flashed.
+OTA_MAX_IMAGE_SIZE := 319488
+
 # mcuboot_primary_app (the running app+TF-M image, inside mcuboot_primary -
 # see pm_static.yml) and mcuboot_secondary's own base addresses - both fixed
 # by the same static partition layout regardless of build variant (verified
@@ -357,11 +377,17 @@ ifeq ($(filter $(SLOT),0 1),)
 $(error SLOT must be 0 or 1 (got "$(SLOT)"))
 endif
 
-# Where `ota` leaves the final signed binary - a plain top-level directory,
-# not inside build-ota/ (west's own scratch/CMake tree), so this is the one
-# stable path worth pointing a flashing step or a delivery script at,
-# regardless of whatever west's own directory layout does across versions.
-OTA_OUT_DIR := ota
+# Where `build` and `ota` leave their final binaries - the project root, not
+# inside build*/ (west's own scratch/CMake trees), so these are the stable
+# paths worth pointing a flashing step or a delivery script at, regardless
+# of whatever west's own directory layout does across versions.
+# FIRMWARE_BIN is the full flash image (merged.hex flattened from 0x0,
+# gaps filled with 0xff) and is only written by the default UART build -
+# not LOG=rtt's debugging variant, and not `ota`'s own pass through `build`
+# (see the $(filter) in `build`'s recipe). OTA_FIRMWARE_BIN is the signed
+# app image for mcuboot_secondary.
+FIRMWARE_BIN     := nodem_NRF9151.bin
+OTA_FIRMWARE_BIN := nodem_NRF9151-ota.bin
 
 all: run
 
@@ -370,6 +396,12 @@ nodem-ffi:
 
 build: nodem-ffi
 	$(NCS_ENV) && west build -b $(BOARD) -d $(ACTIVE_BUILD_DIR) zephyr-app $(EXTRA_CONF_ARGS)
+	@size=$$(stat -c%s $(ACTIVE_BUILD_DIR)/zephyr-app/zephyr/zephyr.signed.bin); \
+	if [ $$size -gt $(OTA_MAX_IMAGE_SIZE) ]; then \
+		echo "❌ signed image is $$size bytes, over MCUboot's $(OTA_MAX_IMAGE_SIZE) byte limit - it would not boot (see OTA_MAX_IMAGE_SIZE)"; \
+		exit 1; \
+	fi
+	$(if $(filter $(BUILD_DIR),$(ACTIVE_BUILD_DIR)),$(NCS_ENV) && arm-zephyr-eabi-objcopy -I ihex -O binary --gap-fill 0xff $(MERGED_HEX) $(FIRMWARE_BIN) && echo "✅ Firmware image: $(FIRMWARE_BIN)")
 
 flash:
 ifeq ($(INIT),1)
@@ -419,16 +451,12 @@ ota: CARGO_LOG_FEATURE := $(OTA_CARGO_LOG_FEATURE)
 ota: EXTRA_CONF_ARGS   := $(OTA_EXTRA_CONF_ARGS)
 ota: ACTIVE_BUILD_DIR  := $(BUILD_OTA_DIR)
 ota: build
-	@mkdir -p $(OTA_OUT_DIR)
-	@cp $(BUILD_OTA_DIR)/zephyr-app/zephyr/zephyr.signed.bin $(OTA_OUT_DIR)/zephyr.signed.bin
-	@size=$$(stat -c%s $(OTA_OUT_DIR)/zephyr.signed.bin); \
-	pct=$$(( size * 100 / $(OTA_SLOT_SIZE) )); \
+	@cp $(BUILD_OTA_DIR)/zephyr-app/zephyr/zephyr.signed.bin $(OTA_FIRMWARE_BIN)
+	@size=$$(stat -c%s $(OTA_FIRMWARE_BIN)); \
+	pct=$$(( size * 100 / $(OTA_MAX_IMAGE_SIZE) )); \
 	echo; \
-	echo "✅ OTA image: $(OTA_OUT_DIR)/zephyr.signed.bin"; \
-	echo "   $$size / $(OTA_SLOT_SIZE) bytes ($$pct% of the 320KB OTA slot)"; \
-	if [ $$size -gt $(OTA_SLOT_SIZE) ]; then \
-		echo "   ⚠️  over the slot size - this will not fit in mcuboot_secondary"; \
-	fi
+	echo "✅ OTA image: $(OTA_FIRMWARE_BIN)"; \
+	echo "   $$size / $(OTA_MAX_IMAGE_SIZE) bytes ($$pct% of MCUboot's max image size)"
 
 flash-ota:
 ifeq ($(SLOT),0)
@@ -454,5 +482,5 @@ else
 endif
 
 clean:
-	rm -rf $(BUILD_DIR) $(BUILD_RTT_DIR) $(BUILD_OTA_DIR) $(OTA_OUT_DIR)
+	rm -rf $(BUILD_DIR) $(BUILD_RTT_DIR) $(BUILD_OTA_DIR) $(FIRMWARE_BIN) $(OTA_FIRMWARE_BIN)
 	cd nodem-ffi && cargo clean

@@ -4,8 +4,9 @@ use nodem_rs::control::{Control, ControlMode, IControl, IControlLoader, LoaderRe
 use nodem_rs::media::Media;
 
 // C ABI this bridges to - config_store.c (flash-backed key/value store),
-// modem_task.c (LTE/TLS/cloud-registration status), and pkg_store.c (raw
-// "pkg" flash partition - see IControlLoader impl below). See those files'
+// modem_task.c (LTE/TLS/cloud-registration status), pkg_store.c (raw "pkg"
+// flash partition) and ota_store.c (MCUboot secondary slot) - see the
+// IControlLoader impl below for the last two. See those files'
 // headers for the full doc comments. nodem_listener.c's actual
 // nodem_hw_reset() is deliberately *not* called from here - see `restart`'s
 // doc comment below.
@@ -16,11 +17,17 @@ unsafe extern "C" {
     fn pkg_store_capacity() -> usize;
     fn pkg_store_erase(len: usize) -> i32;
     fn pkg_store_write(offset: usize, buf: *const u8, len: usize) -> i32;
+    fn ota_store_capacity() -> usize;
+    fn ota_store_start(len: usize) -> i32;
+    fn ota_store_write(buf: *const u8, len: usize) -> i32;
+    fn ota_store_finish() -> i32;
 }
 
 // Matches pkg_store.h's PKG_STORE_MAX_CHUNK - pkg_store_write() rejects
-// anything longer than this in one call.
-const PKG_CHUNK_LEN: usize = 512;
+// anything longer than this in one call. OTA uploads flush in chunks of the
+// same size too (ota_store_write() itself has no limit - flash_img buffers
+// internally - this just avoids a C call per byte).
+const LOADER_CHUNK_LEN: usize = 512;
 
 // Matches config_store.h's MAX_KEY_LEN/MAX_STR_LEN (+1 for the NUL each C
 // call needs) - kept as separate constants here since control.rs has no way
@@ -62,7 +69,8 @@ enum Ret {
 /// provision cloud registration (config_store.c's flash-backed key/value
 /// store; modem_task.c's step_register() does the actual work), "#nvs" to
 /// list that store's contents, "#stat" against modem_task.c's connection
-/// status, and "#reset". More of "controlling all aspects of NRF hardware"
+/// status, and "#reset". Also receives nodem-rs's "pkg" and "ota" uploads
+/// (see the IControlLoader impl below). More of "controlling all aspects of NRF hardware"
 /// is meant to grow the same way - a small C bridge function (see
 /// nodem_listener.c) plus a case here.
 ///
@@ -73,13 +81,19 @@ enum Ret {
 /// only after the response has been written out) is what acts on it.
 pub struct ZephyrControl {
     restart: bool,
-    // Backing store for "pkg" uploads (see the IControlLoader impl below) -
-    // same shape as nodem-esp32's command_listener.rs: bytes are buffered
-    // here up to PKG_CHUNK_LEN before being flushed to pkg_store_write() in
-    // one call, since neither pkg_store.c's write-block padding nor a flash
-    // driver in general wants to be called one byte at a time.
-    pkg_buf: [u8; PKG_CHUNK_LEN],
-    pkg_buf_len: usize,
+    // Which upload the IControlLoader calls currently belong to - only
+    // process_loader_start() is told the mode, process_loader_data()/end()
+    // aren't, so it's remembered here to route those to the matching
+    // pkg_*/ota_* functions.
+    loader_mode: ControlMode,
+    // Staging buffer shared by "pkg" and "ota" uploads (only one can be in
+    // progress at a time) - same shape as nodem-esp32's command_listener.rs:
+    // bytes are buffered here up to LOADER_CHUNK_LEN before being flushed to
+    // pkg_store_write()/ota_store_write() in one call, since nodem-rs hands
+    // them over one byte at a time and neither a flash driver nor the FFI
+    // boundary wants to be called that often.
+    loader_buf: [u8; LOADER_CHUNK_LEN],
+    loader_buf_len: usize,
     // Absolute offset in the "pkg" partition of the next byte to be written -
     // process_loader_end() needs this to flush a final, sub-PKG_CHUNK_LEN
     // chunk, since (unlike process_loader_data()) it isn't given a position.
@@ -94,16 +108,21 @@ pub struct ZephyrControl {
     // the exact function that already loads the "pkg" partition at boot -
     // so an upload takes effect right away instead of only on next reboot.
     pkg_ready: bool,
+    // Set once any ota_store_write() of the current upload has failed, so
+    // process_loader_end() doesn't mark a partially-written image pending.
+    ota_failed: bool,
 }
 
 impl ZephyrControl {
     pub const fn new() -> Self {
         Self {
             restart: false,
-            pkg_buf: [0u8; PKG_CHUNK_LEN],
-            pkg_buf_len: 0,
+            loader_mode: ControlMode::LineMode,
+            loader_buf: [0u8; LOADER_CHUNK_LEN],
+            loader_buf_len: 0,
             pkg_written: 0,
             pkg_ready: false,
+            ota_failed: false,
         }
     }
 
@@ -241,78 +260,176 @@ impl IControl for ZephyrControl {
     }
 }
 
-/// Streams a "pkg" upload - a nodem-rs binary UI/Media package, same format
-/// and same upload protocol as nodem-esp32, *not* a firmware image - straight
-/// into the "pkg" flash partition (pkg_store.c/pm_static.yml): erase up
-/// front in `process_loader_start`, forward-only writes in
-/// `process_loader_data`, flush the final partial chunk in
-/// `process_loader_end`. Ported from nodem-esp32's command_listener.rs, with
-/// pkg_store.c's flash_area calls standing in for ESP-IDF's `EspPartition`.
-/// Unlike that project, there's no mmap step needed here to make the written
-/// bytes loadable - the nRF9151's internal flash is already directly
-/// addressable at its physical address (PM_PKG_ADDRESS), no explicit mapping
-/// call required. Actually loading a fully-received package into the
-/// running DOM/Surface is nodem-rs's own concern, not this bridge's.
+/// Receives nodem-rs's two upload kinds and routes them by mode: "pkg"
+/// (ControlMode::PKGMode, a nodem-rs UI/Media package - see the pkg_* block
+/// below) and "ota" (ControlMode::OTAMode, a firmware update - see the ota_*
+/// block below).
 impl IControlLoader for ZephyrControl {
     fn process_loader_start(&mut self, mode: ControlMode, len: usize) -> usize {
+        self.loader_mode = mode;
+        self.loader_buf_len = 0;
+
         match mode {
-            ControlMode::PKGMode => {
-        
-                log::info!("pkg loader start: {len}b");
-                self.pkg_buf_len = 0;
-                self.pkg_written = 0;
-
-                let capacity = unsafe { pkg_store_capacity() };
-                if capacity < len {
-                    log::error!("'pkg' partition ({capacity}b) too small for {len}b upload");
-                    return 0;
-                }
-
-                if unsafe { pkg_store_erase(len) } != 0 {
-                    log::error!("'pkg' partition erase failed");
-                    return 0;
-                }
-
-                capacity
-            }
-            _ => 0
+            ControlMode::PKGMode => self.pkg_start(len),
+            ControlMode::OTAMode => self.ota_start(len),
+            _ => 0,
         }
     }
 
     fn process_loader_data(&mut self, buf: &[u8], pos: usize) {
-        for (i, &byte) in buf.iter().enumerate() {
-            self.pkg_buf[self.pkg_buf_len] = byte;
-            self.pkg_buf_len += 1;
-
-            if self.pkg_buf_len == PKG_CHUNK_LEN {
-                self.pkg_buf_len = 0;
-
-                let offset = pos + i + 1 - PKG_CHUNK_LEN;
-                let err = unsafe { pkg_store_write(offset, self.pkg_buf.as_ptr(), PKG_CHUNK_LEN) };
-                if err != 0 {
-                    log::error!("'pkg' partition write at {offset} failed: {err}");
-                }
-                self.pkg_written = offset + PKG_CHUNK_LEN;
-            }
+        match self.loader_mode {
+            ControlMode::PKGMode => self.pkg_data(buf, pos),
+            ControlMode::OTAMode => self.ota_data(buf),
+            _ => {}
         }
     }
 
     fn process_loader_end(&mut self) -> LoaderRet {
-        log::info!("pkg loader end: {}b", self.pkg_written + self.pkg_buf_len);
+        let mode = core::mem::replace(&mut self.loader_mode, ControlMode::LineMode);
 
-        if self.pkg_buf_len > 0 {
-            let err =
-                unsafe { pkg_store_write(self.pkg_written, self.pkg_buf.as_ptr(), self.pkg_buf_len) };
+        match mode {
+            ControlMode::PKGMode => self.pkg_end(),
+            ControlMode::OTAMode => self.ota_end(),
+            _ => LoaderRet::UnsupportedMode,
+        }
+    }
+}
+
+/// Streams a "pkg" upload - a nodem-rs binary UI/Media package, same format
+/// and same upload protocol as nodem-esp32, *not* a firmware image - straight
+/// into the "pkg" flash partition (pkg_store.c/pm_static.yml): erase up
+/// front in `pkg_start`, forward-only writes in `pkg_data`, flush the final
+/// partial chunk in `pkg_end`. Ported from nodem-esp32's command_listener.rs,
+/// with pkg_store.c's flash_area calls standing in for ESP-IDF's
+/// `EspPartition`. Unlike that project, there's no mmap step needed here to
+/// make the written bytes loadable - the nRF9151's internal flash is already
+/// directly addressable at its physical address (PM_PKG_ADDRESS), no explicit
+/// mapping call required. Actually loading a fully-received package into the
+/// running DOM/Surface is nodem-rs's own concern, not this bridge's.
+impl ZephyrControl {
+    fn pkg_start(&mut self, len: usize) -> usize {
+        log::info!("pkg loader start: {len}b");
+        self.pkg_written = 0;
+
+        let capacity = unsafe { pkg_store_capacity() };
+        if capacity < len {
+            log::error!("'pkg' partition ({capacity}b) too small for {len}b upload");
+            return 0;
+        }
+
+        if unsafe { pkg_store_erase(len) } != 0 {
+            log::error!("'pkg' partition erase failed");
+            return 0;
+        }
+
+        capacity
+    }
+
+    fn pkg_data(&mut self, buf: &[u8], pos: usize) {
+        for (i, &byte) in buf.iter().enumerate() {
+            self.loader_buf[self.loader_buf_len] = byte;
+            self.loader_buf_len += 1;
+
+            if self.loader_buf_len == LOADER_CHUNK_LEN {
+                self.loader_buf_len = 0;
+
+                let offset = pos + i + 1 - LOADER_CHUNK_LEN;
+                let err = unsafe { pkg_store_write(offset, self.loader_buf.as_ptr(), LOADER_CHUNK_LEN) };
+                if err != 0 {
+                    log::error!("'pkg' partition write at {offset} failed: {err}");
+                }
+                self.pkg_written = offset + LOADER_CHUNK_LEN;
+            }
+        }
+    }
+
+    fn pkg_end(&mut self) -> LoaderRet {
+        log::info!("pkg loader end: {}b", self.pkg_written + self.loader_buf_len);
+
+        if self.loader_buf_len > 0 {
+            let err = unsafe {
+                pkg_store_write(self.pkg_written, self.loader_buf.as_ptr(), self.loader_buf_len)
+            };
             if err != 0 {
                 log::error!("'pkg' partition write at {} failed: {err}", self.pkg_written);
-                self.pkg_buf_len = 0;
+                self.loader_buf_len = 0;
                 return LoaderRet::PKGFailed;
             }
-            self.pkg_written += self.pkg_buf_len;
-            self.pkg_buf_len = 0;
+            self.pkg_written += self.loader_buf_len;
+            self.loader_buf_len = 0;
         }
 
         self.pkg_ready = true;
+        LoaderRet::Ok
+    }
+}
+
+/// Streams an "ota" upload - the signed MCUboot image `make ota` builds
+/// (nodem_NRF9151-ota.bin) - into the "mcuboot_secondary" slot via
+/// ota_store.c (Zephyr's flash_img, erasing progressively as data arrives).
+/// On success `ota_end` marks the slot pending and sets `restart`, so the
+/// device reboots right after the "ota0" reply has gone out; MCUboot then
+/// swaps the new image in as a one-time test, and heartbeat_task.c's
+/// ota_confirm_if_due() makes it permanent once it has run for a while (or
+/// MCUboot reverts it on the next reset if it never gets that far).
+impl ZephyrControl {
+    fn ota_start(&mut self, len: usize) -> usize {
+        log::info!("ota loader start: {len}b");
+        self.ota_failed = false;
+
+        let capacity = unsafe { ota_store_capacity() };
+        if capacity < len {
+            log::error!("'mcuboot_secondary' slot ({capacity}b) too small for {len}b upload");
+            return 0;
+        }
+
+        if unsafe { ota_store_start(len) } != 0 {
+            log::error!("'mcuboot_secondary' slot init failed");
+            return 0;
+        }
+
+        capacity
+    }
+
+    fn ota_data(&mut self, buf: &[u8]) {
+        for &byte in buf {
+            self.loader_buf[self.loader_buf_len] = byte;
+            self.loader_buf_len += 1;
+
+            if self.loader_buf_len == LOADER_CHUNK_LEN {
+                self.ota_flush();
+            }
+        }
+    }
+
+    fn ota_flush(&mut self) {
+        let len = core::mem::take(&mut self.loader_buf_len);
+        if len == 0 || self.ota_failed {
+            return;
+        }
+
+        let err = unsafe { ota_store_write(self.loader_buf.as_ptr(), len) };
+        if err != 0 {
+            log::error!("'mcuboot_secondary' slot write failed: {err}");
+            self.ota_failed = true;
+        }
+    }
+
+    fn ota_end(&mut self) -> LoaderRet {
+        self.ota_flush();
+
+        if self.ota_failed {
+            return LoaderRet::PKGFailed;
+        }
+
+        let err = unsafe { ota_store_finish() };
+        if err != 0 {
+            log::error!("ota image rejected: {err}");
+            return LoaderRet::PKGFailed;
+        }
+
+        log::info!("ota loader end: image pending, rebooting");
+        self.restart = true;
         LoaderRet::Ok
     }
 }
