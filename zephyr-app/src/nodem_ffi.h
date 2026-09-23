@@ -26,6 +26,23 @@ void *nodem_runtime_new(uint8_t *fb_ptr, size_t fb_len, uint16_t width, uint16_t
 bool nodem_load_pkg(void *handle);
 
 bool nodem_runtime_run(void *handle);
+
+/*
+ * Sets a short status message nodem draws in a centered popup box every
+ * frame while set (nodem-rs's runtime.rs, RuntimePrivate::popup(), called
+ * from DOM::run()) - a new call replaces whatever was set before, it doesn't
+ * queue. `text_ptr`/`text_len` only need to stay valid for the call itself;
+ * they're copied into a static buffer on the Rust side (64 bytes - see
+ * lib.rs's STATUS_MESSAGE_BUF_SIZE), not borrowed. Returns false (message
+ * left unset/unchanged) if `text_len` is too long or isn't valid UTF-8.
+ */
+bool nodem_status_message_set(void *handle, const uint8_t *text_ptr, size_t text_len);
+
+/*
+ * Clears the status message set by nodem_status_message_set() - nothing is
+ * drawn for it from the next frame onward.
+ */
+void nodem_status_message_clear(void *handle);
 size_t nodem_process_command(void *handle, const uint8_t *input_ptr, size_t input_len,
 			      uint8_t *output_ptr, size_t output_cap, size_t *output_len);
 

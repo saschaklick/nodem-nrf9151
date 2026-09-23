@@ -9,6 +9,10 @@
 #   make reconfigure  - send commands from reconfigure.cmds to the device
 #   make run          - build, flash, then stream logs
 #   make clean        - remove build output
+#   make ota          - build a release OTA image (see its own note below)
+#   make flash-ota SLOT=0|1
+#                     - flash that image straight into a slot over SWD,
+#                       simulating an OTA delivery (see its own note below)
 #
 #   LOG=rtt make <build|flash|logs|run>
 #                     - same targets, but for the RTT-over-SWD logging
@@ -38,9 +42,85 @@
 #                       same way INIT=1 does: `make build LOG=rtt
 #                       LOG_LEVEL=error`.
 #
+#   make ota          - build a signed release image for the MCUboot
+#                       secondary (OTA) slot, into its own build-ota/
+#                       directory - never the same one `make build`/`flash`
+#                       use, so building an OTA image never clobbers (and is
+#                       never clobbered by) whatever's currently flashed and
+#                       under test on the bench. Sysbuild+MCUboot already
+#                       signs every app image unconditionally (see
+#                       sysbuild.conf) - this isn't a separate signing step,
+#                       just a build whose defaults suit an image meant to
+#                       run unattended on a real device rather than one
+#                       being watched live over `logs`: LOG_LEVEL defaults
+#                       to "error" here (not "debug" - see above), though
+#                       it's still the same switch, so `LOG_LEVEL=debug make
+#                       ota` works if a debug-logging OTA build is ever
+#                       actually wanted. The resulting signed binary is
+#                       copied to ota/zephyr.signed.bin (see OTA_OUT_DIR
+#                       below) - a stable path outside west's own
+#                       build-ota/ tree - and its size is reported against
+#                       the 320KB-per-slot budget (pm_static.yml).
+#
+#   make flash-ota SLOT=0|1 (default 1)
+#                     - flashes the last `make ota` build directly into a
+#                       slot over SWD (via nrfutil, like plain `flash`) -
+#                       standing in for the still-unbuilt real OTA delivery
+#                       path (network download + write, see sysbuild.conf's
+#                       note) so the swap/rollback machinery can be
+#                       exercised now, on the bench, without it. Both slots
+#                       flash the exact same underlying image
+#                       (build-ota/zephyr-app/zephyr/tfm_merged.hex - the
+#                       TF-M+app pair MCUboot swaps as one unit) - only the
+#                       destination address, and for SLOT=1 an extra
+#                       imgtool `--pad` pass, differ:
+#
+#                       SLOT=0 - straight into mcuboot_primary_app
+#                       (0x8200): overwrites the currently-running image in
+#                       place, no swap/test/rollback involved at all -
+#                       equivalent to `make flash` but sourced from ota/
+#                       instead of build/. Uses zephyr.signed.hex as-is, no
+#                       repackaging (it's already addressed there).
+#
+#                       SLOT=1 - into mcuboot_secondary (0x58000, the real
+#                       OTA slot): imgtool signs a *second* copy of the same
+#                       image with --pad (not --confirm), so its trailer
+#                       lands exactly like a freshly-delivered pending
+#                       update would - magic set, image-ok unset (see
+#                       bootutil_public.c's boot_swap_tables, the row
+#                       matching that exact combination is BOOT_SWAP_TYPE_
+#                       TEST) - then that's rebased from a 0-based .bin to a
+#                       0x58000-based .hex via objcopy (plain
+#                       zephyr.signed.hex's own addresses are baked in for
+#                       slot0, not reusable here - .bin has none, so it can
+#                       be rebased to either slot). MCUboot performs a
+#                       one-time swap into the primary slot on the very
+#                       next boot; if the new image never confirms itself
+#                       before another reset, MCUboot reverts back to
+#                       whatever was in the primary slot before,
+#                       automatically. heartbeat_task.c's
+#                       ota_confirm_if_due() is the other half of this - it
+#                       runs *in* the newly-booted image and calls
+#                       boot_write_img_confirmed() once 60s of uptime have
+#                       passed, turning that one-time test into a
+#                       permanent, confirmed image before anything would
+#                       otherwise trigger a revert.
+#
+#                       Both branches trigger a plain nrfutil reset
+#                       afterward rather than requiring a manual
+#                       power-cycle - but see the next paragraph's own
+#                       caveat for why that's only reliable for SLOT=1, not
+#                       SLOT=0.
+#
 # After flashing, power-cycle the board (unplug/replug USB, or the reset
 # button) - a debugger-triggered reset alone does not reliably re-boot this
-# nRF9151/TF-M setup into the new image.
+# nRF9151/TF-M setup into the new image. `flash-ota SLOT=1` is the one
+# exception: it never touches the actively-executing primary slot (only the
+# inert secondary slot), so this caveat doesn't apply and a plain reset is
+# enough to make MCUboot see and swap in the pending image. `flash-ota
+# SLOT=0` overwrites the primary slot exactly like plain `flash` does, so
+# it's subject to the same caveat - fall back to a manual power-cycle there
+# if a reset doesn't bring the new image up.
 #
 # `flash` uses nrfutil (Nordic's own tool, the documented successor to the
 # now-deprecated nrfjprog - see https://docs.nordicsemi.com for
@@ -156,7 +236,7 @@
 # process_command UART - see scripts/reconfigure.sh for the exact protocol
 # and why there's no fixed command sequence baked in.
 
-.PHONY: all build nodem-ffi flash reset logs reconfigure run clean
+.PHONY: all build nodem-ffi flash reset logs reconfigure run clean ota flash-ota
 
 NCS_ENV := . $(CURDIR)/ncs_env.sh
 
@@ -198,22 +278,17 @@ LOG ?= uart
 # see nodem-ffi/Cargo.toml), so both sides drop the same levels together.
 LOG_LEVEL ?= debug
 
-ifeq ($(LOG_LEVEL),info)
-LOG_LEVEL_CONF    := log-info.conf
-CARGO_LOG_FEATURE := log-info
-else ifeq ($(LOG_LEVEL),warn)
-LOG_LEVEL_CONF    := log-warn.conf
-CARGO_LOG_FEATURE := log-warn
-else ifeq ($(LOG_LEVEL),error)
-LOG_LEVEL_CONF    := log-error.conf
-CARGO_LOG_FEATURE := log-error
-else ifeq ($(LOG_LEVEL),none)
-LOG_LEVEL_CONF    := log-none.conf
-CARGO_LOG_FEATURE := log-none
-else
-LOG_LEVEL_CONF    :=
-CARGO_LOG_FEATURE := log-debug
-endif
+# $(call level_conf,LEVEL) / $(call level_feature,LEVEL) - map a LOG_LEVEL
+# name to its zephyr-app/log-*.conf fragment (empty for "debug" - Kconfig's
+# own default, no fragment needed) and its nodem-ffi Cargo feature. Factored
+# out of the plain ifeq chain this used to be so `make ota` below can map
+# its own, separately-defaulted level the same way without duplicating the
+# five-way branch.
+level_conf = $(if $(filter info,$(1)),log-info.conf,$(if $(filter warn,$(1)),log-warn.conf,$(if $(filter error,$(1)),log-error.conf,$(if $(filter none,$(1)),log-none.conf,))))
+level_feature = $(if $(filter info,$(1)),log-info,$(if $(filter warn,$(1)),log-warn,$(if $(filter error,$(1)),log-error,$(if $(filter none,$(1)),log-none,log-debug))))
+
+LOG_LEVEL_CONF    := $(call level_conf,$(LOG_LEVEL))
+CARGO_LOG_FEATURE := $(call level_feature,$(LOG_LEVEL))
 
 # Zephyr's EXTRA_CONF_FILE takes a ';'-separated list, so LOG=rtt's rtt.conf
 # and LOG_LEVEL's log-*.conf (either, neither, or both may apply) compose
@@ -243,6 +318,50 @@ endif
 # note. Switches `flash` between its narrow, NVS/pkg-preserving erase and
 # the full mass-erase + UICR-unlock recovery path.
 INIT ?= 0
+
+# make ota - see the header comment's own note. Own build directory (never
+# BUILD_DIR/BUILD_RTT_DIR) and its own LOG_LEVEL default ("error", not
+# "debug" - $(origin) is what lets the *default* differ from `build`'s
+# while `LOG_LEVEL=... make ota` on the command line still wins either way,
+# same precedence command-line assignments always have over a plain `?=`).
+BUILD_OTA_DIR := build-ota
+
+ifeq ($(origin LOG_LEVEL),command line)
+OTA_LOG_LEVEL := $(LOG_LEVEL)
+else
+OTA_LOG_LEVEL := error
+endif
+
+OTA_LOG_LEVEL_CONF    := $(call level_conf,$(OTA_LOG_LEVEL))
+OTA_CARGO_LOG_FEATURE := $(call level_feature,$(OTA_LOG_LEVEL))
+OTA_EXTRA_CONF_ARGS   := $(if $(OTA_LOG_LEVEL_CONF),-- -DEXTRA_CONF_FILE="$(OTA_LOG_LEVEL_CONF)",)
+
+# 320KB - mcuboot_primary/mcuboot_secondary's fixed, by-design size (see
+# pm_static.yml's own note on how that number was arrived at); not read
+# back from partitions.yml since that file doesn't exist until after the
+# very build this checks the output of.
+OTA_SLOT_SIZE     := 327680
+OTA_SLOT_SIZE_HEX := 0x50000
+
+# mcuboot_primary_app (the running app+TF-M image, inside mcuboot_primary -
+# see pm_static.yml) and mcuboot_secondary's own base addresses - both fixed
+# by the same static partition layout regardless of build variant (verified
+# identical across build/ and build-ota/'s own partitions.yml).
+SLOT0_ADDR := 0x8200
+SLOT1_ADDR := 0x58000
+
+# SLOT=0|1 for `flash-ota` - see that target's own note.
+SLOT ?= 1
+
+ifeq ($(filter $(SLOT),0 1),)
+$(error SLOT must be 0 or 1 (got "$(SLOT)"))
+endif
+
+# Where `ota` leaves the final signed binary - a plain top-level directory,
+# not inside build-ota/ (west's own scratch/CMake tree), so this is the one
+# stable path worth pointing a flashing step or a delivery script at,
+# regardless of whatever west's own directory layout does across versions.
+OTA_OUT_DIR := ota
 
 all: run
 
@@ -290,6 +409,50 @@ sleep:
 	@echo "⏳ Sleeping.."
 	@sleep 2
 
+# Target-specific variables below override build's/nodem-ffi's own for this
+# whole prerequisite chain (GNU Make propagates a target-specific value down
+# to all of that target's prerequisites, recursively) - so `build`'s recipe
+# runs unchanged, it just picks up build-ota/ and the error-level log conf
+# instead of build/'s own.
+ota: LOG_LEVEL_CONF    := $(OTA_LOG_LEVEL_CONF)
+ota: CARGO_LOG_FEATURE := $(OTA_CARGO_LOG_FEATURE)
+ota: EXTRA_CONF_ARGS   := $(OTA_EXTRA_CONF_ARGS)
+ota: ACTIVE_BUILD_DIR  := $(BUILD_OTA_DIR)
+ota: build
+	@mkdir -p $(OTA_OUT_DIR)
+	@cp $(BUILD_OTA_DIR)/zephyr-app/zephyr/zephyr.signed.bin $(OTA_OUT_DIR)/zephyr.signed.bin
+	@size=$$(stat -c%s $(OTA_OUT_DIR)/zephyr.signed.bin); \
+	pct=$$(( size * 100 / $(OTA_SLOT_SIZE) )); \
+	echo; \
+	echo "✅ OTA image: $(OTA_OUT_DIR)/zephyr.signed.bin"; \
+	echo "   $$size / $(OTA_SLOT_SIZE) bytes ($$pct% of the 320KB OTA slot)"; \
+	if [ $$size -gt $(OTA_SLOT_SIZE) ]; then \
+		echo "   ⚠️  over the slot size - this will not fit in mcuboot_secondary"; \
+	fi
+
+flash-ota:
+ifeq ($(SLOT),0)
+	$(NRFUTIL) device program --firmware $(BUILD_OTA_DIR)/zephyr-app/zephyr/zephyr.signed.hex --options chip_erase_mode=ERASE_RANGES_TOUCHED_BY_FIRMWARE --family $(FAMILY)
+	$(NRFUTIL) device reset --reset-kind RESET_SYSTEM --family $(FAMILY)
+	@echo
+	@echo "Flashed straight into the primary slot (SLOT=0, $(SLOT0_ADDR)) and reset - no swap involved, so it boots directly, but this overwrote the actively-running image itself: if it doesn't come up, power-cycle (unplug/replug) instead, same as plain \`make flash\` (see its own note - a debugger reset doesn't always see freshly-flashed content in the region it was just executing from)."
+else
+	$(NCS_ENV) && \
+	key=$$(sed -n 's/^CONFIG_BOOT_SIGNATURE_KEY_FILE="\(.*\)"$$/\1/p' $(BUILD_OTA_DIR)/mcuboot/zephyr/.config); \
+	python3 "$$ZEPHYR_BASE/../bootloader/mcuboot/scripts/imgtool.py" sign \
+		--version 0.0.0+0 --align 4 --pad-header --header-size 0x200 \
+		--slot-size $(OTA_SLOT_SIZE_HEX) --pad -k "$$key" \
+		$(BUILD_OTA_DIR)/zephyr-app/zephyr/tfm_merged.hex \
+		$(BUILD_OTA_DIR)/zephyr-app/zephyr/zephyr.signed.pending.bin && \
+	arm-zephyr-eabi-objcopy -I binary -O ihex --change-addresses=$(SLOT1_ADDR) \
+		$(BUILD_OTA_DIR)/zephyr-app/zephyr/zephyr.signed.pending.bin \
+		$(BUILD_OTA_DIR)/zephyr-app/zephyr/zephyr.signed.pending.hex
+	$(NRFUTIL) device program --firmware $(BUILD_OTA_DIR)/zephyr-app/zephyr/zephyr.signed.pending.hex --options chip_erase_mode=ERASE_RANGES_TOUCHED_BY_FIRMWARE --family $(FAMILY)
+	$(NRFUTIL) device reset --reset-kind RESET_SYSTEM --family $(FAMILY)
+	@echo
+	@echo "Flashed a pending (unconfirmed) image into the OTA/secondary slot (SLOT=1, $(SLOT1_ADDR)) and reset to trigger it - unlike SLOT=0/plain \`flash\`, this never touched the actively-executing primary slot, so a plain reset (not a power-cycle) reliably sees it: MCUboot swaps it in as a one-time test on this very reset, and auto-reverts if it's never confirmed (see heartbeat_task.c)."
+endif
+
 clean:
-	rm -rf $(BUILD_DIR) $(BUILD_RTT_DIR)
+	rm -rf $(BUILD_DIR) $(BUILD_RTT_DIR) $(BUILD_OTA_DIR) $(OTA_OUT_DIR)
 	cd nodem-ffi && cargo clean

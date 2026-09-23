@@ -1,6 +1,8 @@
 Cargo.lock
 /build/
 /build-rtt/
+/build-ota/
+/ota/
 /nodem-ffi/target/*
 
 # Holds whatever device-reconfiguration commands you're currently using

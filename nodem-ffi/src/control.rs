@@ -1,6 +1,6 @@
 use core::ffi::c_char;
 
-use nodem_rs::control::{Control, IControl, IControlLoader, LoaderRet};
+use nodem_rs::control::{Control, ControlMode, IControl, IControlLoader, LoaderRet};
 use nodem_rs::media::Media;
 
 // C ABI this bridges to - config_store.c (flash-backed key/value store),
@@ -123,22 +123,6 @@ impl IControl for ZephyrControl {
         _media: &Media,
         res: &mut dyn core::fmt::Write,
     ) -> (bool, core::fmt::Result) {
-        // "page=<idx>" - peeked here, not claimed, purely to persist it as
-        // config_store's "last_page" so nodem_task.c can restore it on the
-        // next boot (see its own doc comment there). Always falls through
-        // afterward: this listener runs before DOM's (see runtime.rs's
-        // process_command - the order is deliberate, for exactly this) so
-        // DOM's own "page=" handler still sees the same line and actually
-        // loads the page, same as if this peek didn't exist.
-        if let Some(value) = line.strip_prefix("page=") {
-            let mut val_buf = [0u8; VAL_BUF_LEN];
-            if let Some(v) = to_cstr(value.trim(), &mut val_buf) {
-                unsafe {
-                    let _ = config_set_str(c"last_page".as_ptr(), v.as_ptr() as *const c_char);
-                }
-            }
-        }
-
         let prefix = "#";
         if !line.starts_with(prefix) {
             return (false, Ok(()));
@@ -270,23 +254,29 @@ impl IControl for ZephyrControl {
 /// call required. Actually loading a fully-received package into the
 /// running DOM/Surface is nodem-rs's own concern, not this bridge's.
 impl IControlLoader for ZephyrControl {
-    fn process_loader_start(&mut self, len: usize) -> usize {
-        log::info!("pkg loader start: {len}b");
-        self.pkg_buf_len = 0;
-        self.pkg_written = 0;
+    fn process_loader_start(&mut self, mode: ControlMode, len: usize) -> usize {
+        match mode {
+            ControlMode::PKGMode => {
+        
+                log::info!("pkg loader start: {len}b");
+                self.pkg_buf_len = 0;
+                self.pkg_written = 0;
 
-        let capacity = unsafe { pkg_store_capacity() };
-        if capacity < len {
-            log::error!("'pkg' partition ({capacity}b) too small for {len}b upload");
-            return 0;
+                let capacity = unsafe { pkg_store_capacity() };
+                if capacity < len {
+                    log::error!("'pkg' partition ({capacity}b) too small for {len}b upload");
+                    return 0;
+                }
+
+                if unsafe { pkg_store_erase(len) } != 0 {
+                    log::error!("'pkg' partition erase failed");
+                    return 0;
+                }
+
+                capacity
+            }
+            _ => 0
         }
-
-        if unsafe { pkg_store_erase(len) } != 0 {
-            log::error!("'pkg' partition erase failed");
-            return 0;
-        }
-
-        capacity
     }
 
     fn process_loader_data(&mut self, buf: &[u8], pos: usize) {

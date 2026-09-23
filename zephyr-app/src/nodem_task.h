@@ -17,4 +17,13 @@
  * current callers. Safe to call from any thread, including an ISR. */
 void nodem_task_notify_rx(void);
 
+/* Returns the nodem-ffi runtime handle (see nodem_ffi.h) nodem_task created,
+ * for other threads that need to call a nodem_ffi.h function directly
+ * against it - modem_task.c's modem_status_task() driving
+ * nodem_status_message_set()/_clear() is the current use. NULL until
+ * nodem_task's own thread has actually created it (no ordering is
+ * guaranteed between K_THREAD_DEFINE threads), so callers must check for
+ * that before passing it anywhere. */
+void *nodem_task_get_runtime(void);
+
 #endif /* NODEM_TASK_H_ */

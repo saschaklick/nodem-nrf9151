@@ -2,5 +2,8 @@
     "rust-analyzer.linkedProjects": [
         "./nodem-ffi/Cargo.toml"
     ],
-    "cmake.sourceDirectory": "/home/cli/nodem-nrf9151/zephyr-app"
+    "rust-analyzer.cargo.features": [
+        "base"
+    ],
+    "cmake.sourceDirectory": "/home/cli/nodem-nrf9151/zephyr-app",
 }

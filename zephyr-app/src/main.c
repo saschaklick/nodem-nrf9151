@@ -10,9 +10,11 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/dfu/mcuboot.h>
 #include <zephyr/drivers/gpio.h>
 
 #include "config_store.h"
+#include "heartbeat_task.h"
 #include "log.h"
 
 #define TAG "main"
@@ -23,6 +25,22 @@ static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 int main(void)
 {
 	info(TAG, "main() entered");
+
+	/* MCUboot always executes from the primary slot - there's no "running
+	 * from slot 1" to report post-swap, the swap physically moves bytes
+	 * into slot 0 before this ever runs. What *is* knowable: whether this
+	 * boot is a freshly-swapped-in OTA image MCUboot is still only
+	 * running as a one-time test (boot_is_img_confirmed() == false, see
+	 * the Makefile's `flash-ota SLOT=1` and heartbeat_task.c's own note),
+	 * or an already-confirmed image (either the original factory image,
+	 * or a previously-confirmed OTA update - the two are indistinguishable
+	 * from here once confirmed, since confirming doesn't record *when*). */
+	if (boot_is_img_confirmed()) {
+		info(TAG, "boot: image confirmed");
+	} else {
+		info(TAG, "boot: image pending - OTA test swap, reverts if not confirmed within %ds",
+		     HEARTBEAT_OTA_CONFIRM_SECONDS);
+	}
 
 	int err = config_store_init();
 

@@ -165,6 +165,17 @@ void nodem_task_notify_rx(void)
 	k_sem_give(&nodem_rx_sem);
 }
 
+/* See nodem_task_get_runtime()'s doc comment (nodem_task.h). Set once,
+ * below, right after nodem_runtime_new() succeeds - read-only from every
+ * other thread after that, so no synchronization beyond the NULL check
+ * those callers already have to do for the "not created yet" case. */
+static void *g_runtime;
+
+void *nodem_task_get_runtime(void)
+{
+	return g_runtime;
+}
+
 static void nodem_task(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
@@ -177,6 +188,8 @@ static void nodem_task(void *p1, void *p2, void *p3)
 		error(TAG, "nodem_runtime_new failed");
 		return;
 	}
+
+	g_runtime = runtime;
 
 	/* Deferred until after the first nodem_runtime_run() below, not called
 	 * here - DOM::run()'s very first call is nodem's own initialization
@@ -227,8 +240,8 @@ static void nodem_task(void *p1, void *p2, void *p3)
 			}
 
 			k_sem_take(&nodem_rx_sem, K_MSEC(remaining));
-		}
-
+		}		
+		
 		nodem_runtime_run(runtime);
 
 		if (!pkg_loaded) {

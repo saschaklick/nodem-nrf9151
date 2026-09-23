@@ -242,6 +242,62 @@ pub extern "C" fn nodem_runtime_run(handle: *mut c_void) -> bool {
     dom.run()
 }
 
+// Backs `nodem_status_message_set` below - copied into, not borrowed from,
+// the caller's memory: `DOM::status_message` (nodem-rs's runtime.rs) has to
+// stay valid across every subsequent nodem_runtime_run() call, long after
+// this call's own arguments go out of scope on the C side. Only one message
+// is ever shown at a time (matches DOM's own `Option<&str>` field), so a
+// single static buffer is enough - no need for anything fancier. `nodem_*`
+// functions are only ever called from nodem_task's one thread (see this
+// file's other `static mut`s), so this needs no additional synchronization.
+const STATUS_MESSAGE_BUF_SIZE: usize = 64;
+static mut STATUS_MESSAGE_BUF: [u8; STATUS_MESSAGE_BUF_SIZE] = [0; STATUS_MESSAGE_BUF_SIZE];
+
+/// Sets the runtime's status message - a short popup nodem-rs draws centered
+/// on screen every frame while set (see runtime.rs's RuntimePrivate::popup(),
+/// called from DOM::run()). A new call replaces whatever was set before, it
+/// doesn't queue. Returns false (message left unset/unchanged) if `text_len`
+/// is too long for STATUS_MESSAGE_BUF_SIZE or isn't valid UTF-8, rather than
+/// truncating into a possibly-corrupt string.
+#[unsafe(no_mangle)]
+pub extern "C" fn nodem_status_message_set(
+    handle: *mut c_void,
+    text_ptr: *const u8,
+    text_len: usize,
+) -> bool {
+    if text_len > STATUS_MESSAGE_BUF_SIZE {
+        return false;
+    }
+
+    let input = unsafe { slice::from_raw_parts(text_ptr, text_len) };
+    let Ok(_) = core::str::from_utf8(input) else {
+        return false;
+    };
+
+    let dom = unsafe { &mut *(handle as *mut DOM) };
+
+    unsafe {
+        let buf: &'static mut [u8; STATUS_MESSAGE_BUF_SIZE] = &mut *(&raw mut STATUS_MESSAGE_BUF);
+
+        buf[..text_len].copy_from_slice(input);
+        // Safety: just validated as UTF-8 above, straight from this same
+        // byte range.
+        let stored: &'static str = core::str::from_utf8_unchecked(&buf[..text_len]);
+
+        dom.status_message = Some(stored);
+    }
+
+    true
+}
+
+/// Clears the runtime's status message (see `nodem_status_message_set`) -
+/// nothing is drawn for it from the next frame onward.
+#[unsafe(no_mangle)]
+pub extern "C" fn nodem_status_message_clear(handle: *mut c_void) {
+    let dom = unsafe { &mut *(handle as *mut DOM) };
+    dom.status_message = None;
+}
+
 /// Feeds one command line into the runtime and writes its text response into
 /// `output_ptr`/`output_cap`, storing the number of bytes written in
 /// `*output_len`. Returns the number of input bytes consumed.

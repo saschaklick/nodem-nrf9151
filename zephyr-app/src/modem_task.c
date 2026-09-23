@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <zephyr/kernel.h>
@@ -26,6 +27,7 @@
 
 #include "config_store.h"
 #include "log.h"
+#include "nodem_ffi.h"
 #include "nodem_task.h"
 
 #define TAG "modem"
@@ -957,6 +959,17 @@ static const char *state_name(enum step_state state)
 
 size_t modem_status_format(char *buf, size_t buf_len)
 {
+	/* MODEM_STEP_REGISTER only runs during the connection cycle that
+	 * consumes a fresh reg_code (see modem_task()'s MODEM_STEP_TLS case);
+	 * once a device is already registered and reconnects with no new
+	 * code, its g_status entry is never touched again and stays at its
+	 * default STEP_PENDING forever even though registration is done and
+	 * persisted - report it as STEP_OK in that case instead, same as
+	 * step_effectively_ok() does for the on-device status overlay. */
+	enum step_state reg_state = device_registered() ? STEP_OK
+				   : atomic_get(&g_status[MODEM_STEP_REGISTER].state);
+	int reg_err = device_registered() ? 0 : (int)atomic_get(&g_status[MODEM_STEP_REGISTER].err);
+
 	int n = snprintf(buf, buf_len,
 			  "init=%s(%d) sim=%s(%d) pdn=%s(%d) tls=%s(%d) reg=%s(%d) ws=%s(%d) "
 			  "fd=%d wsock=%d",
@@ -968,8 +981,8 @@ size_t modem_status_format(char *buf, size_t buf_len)
 			  (int)atomic_get(&g_status[MODEM_STEP_PDN].err),
 			  state_name(atomic_get(&g_status[MODEM_STEP_TLS].state)),
 			  (int)atomic_get(&g_status[MODEM_STEP_TLS].err),
-			  state_name(atomic_get(&g_status[MODEM_STEP_REGISTER].state)),
-			  (int)atomic_get(&g_status[MODEM_STEP_REGISTER].err),
+			  state_name(reg_state),
+			  reg_err,
 			  state_name(atomic_get(&g_status[MODEM_STEP_WEBSOCKET].state)),
 			  (int)atomic_get(&g_status[MODEM_STEP_WEBSOCKET].err),
 			  (int)atomic_get(&g_tls_fd),
@@ -980,17 +993,231 @@ size_t modem_status_format(char *buf, size_t buf_len)
 
 #define MODEM_STATUS_PERIOD_MS 200 /* 5 Hz */
 
+/* MODEM_STEP_REGISTER is a one-time bootstrap step: modem_task()'s
+ * MODEM_STEP_TLS case only routes through it while registration_pending()
+ * holds, going straight to MODEM_STEP_WEBSOCKET otherwise - so for a device
+ * that's already registered (device_registered()), it never runs again on
+ * any later connection cycle. Its g_status entry is left at its default
+ * STEP_PENDING forever in that case, not STEP_OK, which would otherwise
+ * make it look exactly like a stuck/blocking step to anything walking
+ * g_status[] (modem_status_line() below, and modem_status_task()'s
+ * "is everything up" check) even though there's genuinely nothing left to
+ * do or report for it. */
+static bool step_effectively_ok(enum modem_step step)
+{
+	if (step == MODEM_STEP_REGISTER && device_registered()) {
+		return true;
+	}
+
+	return atomic_get(&g_status[step].state) == STEP_OK;
+}
+
+/* Formats one group's status into `buf` - the first (earliest, in `first`..
+ * `last` order) step short of STEP_OK, plus its error code if it's actually
+ * in STEP_ERROR (a "running"/"pending" state has no meaningful err value to
+ * show), or "<group>: ok" if every step in the range already is. Used to
+ * build modem_status_task()'s two-line display: one call each for the modem
+ * side (INIT..PDN) and the cloud side (TLS..WEBSOCKET). */
+static void modem_status_line(char *buf, size_t buf_len, const char *group, enum modem_step first,
+			       enum modem_step last)
+{
+	for (enum modem_step step = first; step <= last; step++) {
+		if (step_effectively_ok(step)) {
+			continue;
+		}
+
+		enum step_state state = atomic_get(&g_status[step].state);
+		int err = (int)atomic_get(&g_status[step].err);
+
+		if (state == STEP_ERROR && err != 0) {
+			snprintf(buf, buf_len, "%s: %s %s(%d)", group, step_name[step],
+				 state_name(state), err);
+		} else {
+			snprintf(buf, buf_len, "%s: %s %s", group, step_name[step], state_name(state));
+		}
+		return;
+	}
+
+	snprintf(buf, buf_len, "%s: ok", group);
+}
+
+/* The cloud line's own special cases, checked before falling back to
+ * modem_status_line()'s generic TLS..WEBSOCKET step walk: an unregistered
+ * device sits parked in MODEM_STEP_PDN's idle loop (see modem_task()) for
+ * as long as neither registration_pending() nor device_registered() holds -
+ * TLS/REGISTER/WEBSOCKET never even run, so their g_status entries stay at
+ * their default STEP_PENDING forever and the generic walk would just show
+ * an uninformative "cloud:tls pending". Worse, step_register() itself
+ * always reports STEP_OK regardless of whether registration actually
+ * succeeded (see its own doc comment - the reply has to reach "#reg"'s
+ * caller either way), so a rejected code could never surface through
+ * g_status at all without this: reg_code itself (config_store) is the only
+ * place that distinction is recorded. */
+static void modem_status_cloud_line(char *buf, size_t buf_len)
+{
+	if (!device_registered()) {
+		char code[REG_CODE_LEN + 1];
+
+		config_get_str("reg_code", code, sizeof(code), "");
+
+		if (code[0] == '\0') {
+			snprintf(buf, buf_len, "cloud: no reg code");
+			return;
+		}
+
+		if (strcmp(code, REG_CODE_REJECTED) == 0) {
+			snprintf(buf, buf_len, "cloud: reg failed");
+			return;
+		}
+	}
+
+	modem_status_line(buf, buf_len, "cloud", MODEM_STEP_TLS, MODEM_STEP_WEBSOCKET);
+}
+
+/* Refresh cadence for modem_status_modem_line()'s AT+COPS?/AT+CESQ queries -
+ * operator name and signal strength don't change fast enough to need
+ * modem_status_task()'s own 5Hz tick, and it's needless modem NAS traffic to
+ * ask that often. ~2s at MODEM_STATUS_PERIOD_MS. */
+#define MODEM_STATUS_RADIO_REFRESH_TICKS (2000 / MODEM_STATUS_PERIOD_MS)
+
+/* Same shape as modem_status_line() (falls through the same INIT..PDN step
+ * walk first), but once that group is fully STEP_OK, shows the current
+ * operator name and a 0-4 signal bar count instead of a static "ok" - more
+ * useful once there's nothing left in this group to report as broken, and
+ * exactly the window (modem up, cloud maybe still connecting) where the
+ * overlay is otherwise visible anyway showing line2's progress. Both
+ * queries are best-effort: AT+COPS? with no quoted operator name (not
+ * registered on a network yet) or AT+CESQ's "unknown" rsrp sentinel (255)
+ * each just leave that part blank rather than showing garbage. */
+static void modem_status_modem_line(char *buf, size_t buf_len)
+{
+	size_t buf_pos = 0;
+	buf_pos += snprintf(buf, buf_len, "modem: ");
+	
+	for (enum modem_step step = MODEM_STEP_INIT; step <= MODEM_STEP_PDN; step++) {
+		enum step_state state = atomic_get(&g_status[step].state);
+
+		if (state == STEP_OK) {
+			continue;
+		}
+
+		int err = (int)atomic_get(&g_status[step].err);
+
+		if (state == STEP_ERROR && err != 0) {
+			buf_pos += snprintf(buf + buf_pos, buf_len - buf_pos, "%s %s(%d)", step_name[step], state_name(state),
+				 err);
+		} else {
+			buf_pos += snprintf(buf + buf_pos, buf_len - buf_pos, "%s %s", step_name[step], state_name(state));
+		}
+		return;
+	}
+
+	static char s_oper[17];
+	static int s_bars = -1;
+	static uint32_t s_tick;
+
+	if ((s_tick++ % MODEM_STATUS_RADIO_REFRESH_TICKS) == 0) {
+		char resp[48];
+
+		s_oper[0] = '\0';
+		if (!nrf_modem_at_cmd(resp, sizeof(resp), "AT+COPS?")) {
+			const char *start = strchr(resp, '"');
+			const char *end = start ? strchr(start + 1, '"') : NULL;
+
+			if (end && (size_t)(end - start - 1) < sizeof(s_oper)) {
+				memcpy(s_oper, start + 1, (size_t)(end - start - 1));
+				s_oper[end - start - 1] = '\0';
+			}
+		}
+
+		s_bars = -1;
+		if (!nrf_modem_at_cmd(resp, sizeof(resp), "AT+CESQ")) {
+			/* "+CESQ: <rxlev>,<ber>,<rscp>,<ecno>,<rsrq>,<rsrp>" - rsrp
+			 * (the 6th, last field) is what maps to dBm; 0-97 valid,
+			 * 255 means "not known". */
+			const char *p = strchr(resp, ':');
+
+			for (int field = 0; field < 5 && p; field++) {
+				p = strchr(p + 1, ',');
+			}
+
+			int rsrp = p ? atoi(p + 1) : -1;
+
+			if (rsrp >= 0 && rsrp <= 97) {
+				int dbm = rsrp - 140;
+
+				s_bars = dbm >= -80 ? 4
+					: dbm >= -90  ? 3
+					: dbm >= -100 ? 2
+					: dbm >= -110 ? 1
+					: 0;
+			}
+		}
+	}
+
+	/* "[...|]" - 4 slots, one '|' per bar out of s_bars (0-4), '.' for the
+	 * rest, so the filled/empty split is visible at a glance rather than
+	 * needing to read a number. */
+	char bars[7] = "[....]";
+
+	for (int i = 0; i < 4 && i < s_bars; i++) {
+		bars[4 - i] = '|';
+	}
+
+	buf_pos += snprintf(buf + buf_pos, buf_len - buf_pos, "ok");
+	if (s_oper[0] != '\0') {
+		buf_pos += snprintf(buf + buf_pos, buf_len - buf_pos, " '%s'", s_oper);
+	}
+	if (s_bars >= 0) {
+		buf_pos += snprintf(buf + buf_pos, buf_len - buf_pos, " %s", bars);	
+	}
+}
+
+/* Shown on nodem's display via nodem_status_message_set() as two lines - the
+ * modem connection itself (INIT..PDN: modem init, SIM readiness, LTE/PDN
+ * attach) on the first, the cloud connection built on top of it (TLS..
+ * WEBSOCKET: TLS handshake, cloud registration, the live websocket channel)
+ * on the second - cleared entirely only once every step in both groups is
+ * STEP_OK, so the overlay only ever appears when there's actually something
+ * to report. */
 static void modem_status_task(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	char buf[224];
-
 	while (true) {
-		// modem_status_format(buf, sizeof(buf));
-		// info(TAG, "%s", buf);
+		void *runtime = nodem_task_get_runtime();
+
+		if (runtime) {
+			bool all_ok = true;
+
+			for (enum modem_step step = MODEM_STEP_INIT; step < MODEM_STEP_COUNT;
+			     step++) {
+				if (!step_effectively_ok(step)) {
+					all_ok = false;
+					break;
+				}
+			}
+
+			if (all_ok) {
+				nodem_status_message_clear(runtime);
+			} else {
+				char line1[32];
+				char line2[32];
+				char msg[64];
+
+				modem_status_modem_line(line1, sizeof(line1));
+				modem_status_cloud_line(line2, sizeof(line2));
+
+				int len = snprintf(msg, sizeof(msg), "%s\n%s", line1, line2);
+
+				if (len > 0 && (size_t)len < sizeof(msg)) {
+					nodem_status_message_set(runtime, (const uint8_t *)msg,
+								  (size_t)len);
+				}
+			}
+		}
 
 		k_msleep(MODEM_STATUS_PERIOD_MS);
 	}
