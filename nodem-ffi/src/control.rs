@@ -154,7 +154,7 @@ impl IControl for ZephyrControl {
     fn process_line(
         &mut self,
         line: &str,
-        _media: &Media,
+        media: &Media,
         res: &mut dyn core::fmt::Write,
     ) -> (bool, core::fmt::Result) {
         let prefix = "#";
@@ -295,6 +295,22 @@ impl IControl for ZephyrControl {
                 // only reports whole degrees.
                 if temp_ok {
                     let _ = write!(res, "{temp_c}.0");
+                }
+                let _ = res.write_str("\r\n");
+
+                // "pkg,<size>,<available>,<meta>", same as nodem-esp32's:
+                // the loaded pkg's size in bytes (0 if none), the "pkg"
+                // partition's size (the most a future pkg can take - it
+                // replaces the current one), and the pkg's own meta text,
+                // last since it may itself contain commas. Meta only while
+                // a pkg is actually loaded, with line breaks turned into
+                // spaces so it can't split the line.
+                let pkg_size = crate::pkg_size();
+                let _ = write!(res, "pkg,{},{},", pkg_size, unsafe { pkg_store_capacity() });
+                if pkg_size > 0 {
+                    for c in media.get_meta().chars() {
+                        let _ = res.write_char(if c == '\r' || c == '\n' { ' ' } else { c });
+                    }
                 }
                 let _ = res.write_str("\r\n");
 

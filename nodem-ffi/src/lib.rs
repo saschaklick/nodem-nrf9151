@@ -9,7 +9,7 @@ use core::slice;
 
 use embedded_alloc::LlffHeap as Heap;
 use nodem_rs::media;
-use nodem_rs::runtime::{Runtime, DOM};
+use nodem_rs::runtime::{Runtime, DOM, PKG_SYS};
 
 mod control;
 use control::ZephyrControl;
@@ -41,6 +41,15 @@ fn ensure_heap() {
 pub(crate) fn heap_free() -> usize {
     ensure_heap();
     HEAP.free()
+}
+
+/// Size in bytes of the pkg `nodem_load_pkg` last loaded from the "pkg"
+/// partition, 0 if none is loaded - "#stat"'s "pkg" line. Only touched
+/// from nodem_task's thread (both `nodem_load_pkg` and "#stat" run there).
+static mut PKG_SIZE: usize = 0;
+
+pub(crate) fn pkg_size() -> usize {
+    unsafe { PKG_SIZE }
 }
 
 // `nodem_process_command` is only ever called from one thread (nodem_task,
@@ -209,6 +218,38 @@ pub extern "C" fn nodem_runtime_resize(handle: *mut c_void, fb_ptr: *mut u8, fb_
 #[unsafe(no_mangle)]
 pub extern "C" fn nodem_load_pkg(handle: *mut c_void) -> bool {
     let dom = unsafe { &mut *(handle as *mut DOM) };
+    let size = load_pkg(dom);
+
+    // Same as nodem-esp32's load_pkg_partition(): with no pkg loaded from
+    // the partition, drop whatever was loaded before and the DOM built from
+    // its page - both point into flash that no longer holds it. Here on
+    // every failure, not only a missing header: this only ever runs at boot
+    // or right after an upload rewrote the partition, so a pkg loaded
+    // earlier is stale either way.
+    //
+    // Then nodem-rs's built-in system pkg is loaded again, exactly as
+    // `DOM::run()` does on its first frame (source 0): unloading keeps
+    // source 0's libraries, but whatever the failed load touched (e.g. the
+    // single `meta` slot, shared by all sources) may no longer be its, so
+    // this puts the device back in the same state as a fresh boot with no
+    // pkg.
+    if size == 0 {
+        dom.surface.media.unload_pkg();
+        dom.dom.clear();
+
+        let ret = dom.surface.media.load_pkg(PKG_SYS.as_ptr(), PKG_SYS.len(), 0);
+        if !matches!(ret, media::Ret::Ok) {
+            log::error!("sys pkg failed to reload: {}", ret as u8);
+        }
+    }
+
+    unsafe { PKG_SIZE = size };
+    size > 0
+}
+
+/// The actual load - see `nodem_load_pkg`. The loaded pkg's size in bytes,
+/// or 0 if none loaded.
+fn load_pkg(dom: &mut DOM) -> usize {
 
     let mut capacity: usize = 0;
     let ptr = unsafe { pkg_store_data(&raw mut capacity) };
@@ -216,7 +257,7 @@ pub extern "C" fn nodem_load_pkg(handle: *mut c_void) -> bool {
 
     if capacity < 12 || &data[0..4] != b"PKG0" {
         log::info!("no valid pkg in 'pkg' partition");
-        return false;
+        return 0;
     }
 
     // This 4-byte field is the *total* package size, header included - the
@@ -236,7 +277,7 @@ pub extern "C" fn nodem_load_pkg(handle: *mut c_void) -> bool {
     // this has to be validated here rather than left to it.
     if length < 12 || length > capacity {
         log::error!("'pkg' partition: declared length {length}b invalid (capacity {capacity}b)");
-        return false;
+        return 0;
     }
 
     // Source 1: a permanently (flash-)stored package. Source 0 is
@@ -249,11 +290,11 @@ pub extern "C" fn nodem_load_pkg(handle: *mut c_void) -> bool {
     match ret {
         media::Ret::Ok => {
             log::info!("loaded pkg from flash [{length}b]");
-            true
+            length
         }
         _ => {
             log::error!("pkg in flash failed to load: {}", ret as u8);
-            false
+            0
         }
     }
 }
