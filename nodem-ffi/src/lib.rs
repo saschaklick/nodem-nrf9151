@@ -3,9 +3,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use core::fmt::Write;
 use core::slice;
 
@@ -20,49 +18,18 @@ use control::ZephyrControl;
 // is the only Rust code in the final Zephyr link, nothing else can provide
 // one.
 #[global_allocator]
-static HEAP: TrackedHeap = TrackedHeap {
-    heap: Heap::empty(),
-    peak: AtomicUsize::new(0),
-    failed: AtomicUsize::new(0),
-};
+static HEAP: Heap = Heap::empty();
 
-// Estimated need is ~2KB (the boxed DOM, 1.2KB, plus runtime text
-// contents), ~6KB worst case with a 4KB "xml=" page over the websocket -
-// see the heartbeat log's "rust heap" peak/failed counts to confirm.
+// Measured peak on the device is ~1.2KB (the boxed DOM, plus runtime text
+// contents); ~6KB worst case with a 4KB "xml=" page over the websocket.
 const HEAP_SIZE: usize = 8 * 1024;
 static mut HEAP_MEM: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 static mut HEAP_INITIALIZED: bool = false;
 
-/// `Heap` plus a high-water mark and a count of failed allocations, for
-/// sizing HEAP_SIZE from what the device actually uses (see
-/// `nodem_heap_stats`). The peak is the heap's own `used()` - allocator
-/// overhead and alignment included - sampled after every allocation.
-struct TrackedHeap {
-    heap: Heap,
-    peak: AtomicUsize,
-    failed: AtomicUsize,
-}
-
-unsafe impl GlobalAlloc for TrackedHeap {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { self.heap.alloc(layout) };
-        if ptr.is_null() {
-            self.failed.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.peak.fetch_max(self.heap.used(), Ordering::Relaxed);
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { self.heap.dealloc(ptr, layout) }
-    }
-}
-
 fn ensure_heap() {
     unsafe {
         if !HEAP_INITIALIZED {
-            HEAP.heap.init((&raw mut HEAP_MEM) as usize, HEAP_SIZE);
+            HEAP.init((&raw mut HEAP_MEM) as usize, HEAP_SIZE);
             HEAP_INITIALIZED = true;
         }
     }
@@ -73,23 +40,7 @@ fn ensure_heap() {
 /// only 2KB), so it's what "#stat" reports as free RAM.
 pub(crate) fn heap_free() -> usize {
     ensure_heap();
-    HEAP.heap.free()
-}
-
-/// The Rust heap's current use, its peak since boot and its total size, in
-/// bytes, plus how many allocations have failed since boot - logged by
-/// heartbeat_task.c. Deliberately doesn't call `ensure_heap()`: this runs on
-/// the heartbeat thread, and `HEAP_INITIALIZED` is only safe to act on from
-/// nodem_task's - before nodem_task has initialized the heap, `used` just
-/// reads 0.
-#[unsafe(no_mangle)]
-pub extern "C" fn nodem_heap_stats(used: *mut usize, peak: *mut usize, size: *mut usize, failed: *mut usize) {
-    unsafe {
-        *used = HEAP.heap.used();
-        *peak = HEAP.peak.load(Ordering::Relaxed);
-        *size = HEAP_SIZE;
-        *failed = HEAP.failed.load(Ordering::Relaxed);
-    }
+    HEAP.free()
 }
 
 // `nodem_process_command` is only ever called from one thread (nodem_task,

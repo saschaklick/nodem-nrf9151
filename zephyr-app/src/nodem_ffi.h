@@ -9,10 +9,6 @@
 
 void *nodem_runtime_new(uint8_t *fb_ptr, size_t fb_len, uint16_t width, uint16_t height);
 
-/* The Rust heap's current use, its peak since boot and its total size, in
- * bytes, plus how many allocations have failed since boot. */
-void nodem_heap_stats(size_t *used, size_t *peak, size_t *size, size_t *failed);
-
 /* Points `handle`'s rendering at `fb_ptr`/`fb_len` (1bpp, `width` x
  * `height`, same rules as nodem_runtime_new()'s) from now on - the next
  * nodem_runtime_run() renders the current page at the new size. The
