@@ -10,6 +10,7 @@
 #include "config_store.h"
 #include "display_task.h"
 #include "modem_task.h"
+#include "nodem_config.h"
 #include "nodem_ffi.h"
 #include "nodem_listener.h"
 #include "uart_task.h"
@@ -17,32 +18,9 @@
 
 #define TAG "nodem"
 
-#define NODEM_WIDTH    DISPLAY_WIDTH
-#define NODEM_HEIGHT   DISPLAY_HEIGHT
-#define NODEM_FB_SIZE  DISPLAY_BUF_SIZE
-
-static uint8_t nodem_fb[NODEM_FB_SIZE];
-static uint8_t vtiled_fb[NODEM_FB_SIZE];
-
-/* nodem-rs packs pixels row-major, MSB first: bit_index = y * width + x. The
- * SSD1306 GDDRAM wants them page-tiled instead: byte (y/8)*width + x, bit
- * (y%8) LSB-first (LSB = top row of the page). */
-static void convert_to_vtiled(const uint8_t *nodem_buf, uint8_t *out)
-{
-	memset(out, 0, NODEM_FB_SIZE);
-
-	for (int y = 0; y < NODEM_HEIGHT; y++) {
-		for (int x = 0; x < NODEM_WIDTH; x++) {
-			int bit_idx = y * NODEM_WIDTH + x;
-			bool on = nodem_buf[bit_idx / 8] & (1 << (7 - (bit_idx % 8)));
-
-			if (on) {
-				out[(y / 8) * NODEM_WIDTH + x] |= BIT(y % 8);
-			}
-		}
-	}
-}
-
+/* Sized for the largest framebuffer nodem_config.h allows - only the
+ * first nodem_config_buffer_len() bytes of it are in use at any time. */
+static uint8_t nodem_fb[NODEM_FB_MAX_SIZE];
 /* Level comes from nodem-rs's `log` crate at runtime (INFO/WARN/ERROR/...),
  * so this can't go through the fixed-level info()/warn()/error() macros -
  * it builds the same "[TAG] LEVEL message" shape directly instead. */
@@ -192,7 +170,14 @@ static void nodem_task(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	void *runtime = nodem_runtime_new(nodem_fb, sizeof(nodem_fb), NODEM_WIDTH, NODEM_HEIGHT);
+	uint32_t nodem_generation = nodem_config_generation();
+	struct nodem_config nodem;
+
+	nodem_config_get(&nodem);
+	info(TAG, "framebuffer %ux%u", nodem.width, nodem.height);
+
+	void *runtime = nodem_runtime_new(nodem_fb, nodem_config_buffer_len(&nodem), nodem.width,
+					  nodem.height);
 
 	if (!runtime) {
 		error(TAG, "nodem_runtime_new failed");
@@ -243,6 +228,30 @@ static void nodem_task(void *p1, void *p2, void *p3)
 				nodem_load_pkg(runtime);
 			}
 
+			/* A "#nodem" (control.rs, via nodem_config_set())
+			 * changed the config this pass - applied right away,
+			 * same as nodem-esp32's Global::resize_display(): the
+			 * framebuffer is only resized (and cleared) if its
+			 * geometry actually changed, a mapping-only change
+			 * just goes out with the next display_task_submit(). */
+			if (nodem_config_generation() != nodem_generation) {
+				struct nodem_config next;
+
+				nodem_generation = nodem_config_generation();
+				nodem_config_get(&next);
+
+				if (next.width != nodem.width || next.height != nodem.height ||
+				    next.bits_per_pixel != nodem.bits_per_pixel) {
+					memset(nodem_fb, 0, sizeof(nodem_fb));
+					nodem_runtime_resize(runtime, nodem_fb,
+							     nodem_config_buffer_len(&next), next.width,
+							     next.height);
+					info(TAG, "framebuffer resized to %ux%u", next.width,
+					     next.height);
+				}
+				nodem = next;
+			}
+
 			int64_t remaining = deadline - k_uptime_get();
 
 			if (remaining <= 0) {
@@ -290,8 +299,9 @@ static void nodem_task(void *p1, void *p2, void *p3)
 			}
 		}
 
-		convert_to_vtiled(nodem_fb, vtiled_fb);
-		display_task_submit(vtiled_fb, sizeof(vtiled_fb));
+		/* display_task maps this onto the configured panel itself
+		 * (see display_oled_set()). */
+		display_task_submit(nodem_fb, &nodem);
 	}
 }
 

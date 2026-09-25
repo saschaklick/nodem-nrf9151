@@ -4,6 +4,7 @@
 #include <zephyr/kernel.h>
 
 #include "modem_task.h"
+#include "nodem_ffi.h"
 #include "log.h"
 
 #define TAG "heartbeat"
@@ -56,6 +57,12 @@ static void heartbeat_task(void *p1, void *p2, void *p3)
 	while (true) {
 		modem_status_format(buf, sizeof(buf));
 		info(TAG, "%s", buf);
+
+		size_t used, peak, size, failed;
+
+		nodem_heap_stats(&used, &peak, &size, &failed);
+		info(TAG, "rust heap used=%u peak=%u size=%u failed=%u", (unsigned)used,
+		     (unsigned)peak, (unsigned)size, (unsigned)failed);
 
 		ota_confirm_if_due();
 

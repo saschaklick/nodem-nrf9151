@@ -10,6 +10,7 @@ target_sources(app PRIVATE
     src/heartbeat_task.c
     src/log.c
     src/modem_task.c
+    src/nodem_config.c
     src/nodem_listener.c
     src/nodem_task.c
     src/ota_store.c

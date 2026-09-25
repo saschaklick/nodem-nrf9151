@@ -40,6 +40,30 @@
  * the untruncated string would have been (snprintf semantics). */
 size_t modem_status_format(char *buf, size_t buf_len);
 
+/* Formats "#stat"'s modem and cloud lines (control.rs), matching
+ * nodem-esp32's command_listener.rs "stat" shape:
+ *   "modem,<state>,<apn>,<ip>,<rsrp dBm>,<error>\r\n"
+ *   "cloud,<registration>,<connection>,<host>,<device_name>,<error>\r\n"
+ * <state> is one of connecting/connected/failed, <registration> one of
+ * waiting/registering/registered/failed, <connection> one of
+ * disconnected/connecting/connected - the same words nodem-esp32 uses.
+ * Fields that aren't known yet are left empty. Queries the modem over AT
+ * (AT+CGDCONT?/AT+CESQ), so only call it on demand, not periodically.
+ * NUL-terminated, truncated to fit buf_len; returns the length the
+ * untruncated string would have been (snprintf semantics). */
+size_t modem_stat_format(char *buf, size_t buf_len);
+
+/* The modem's internal temperature in whole degrees C (AT%XTEMP?) - the
+ * closest thing to a core temperature the nRF9151 exposes. Returns 0 on
+ * success, or a negative errno if it couldn't be read (e.g. the modem
+ * library isn't initialized yet). */
+int modem_core_temp(int *temp_c);
+
+/* The websocket keepalive ping interval, in seconds - config_store's
+ * "ping" (1..3600, set via control.rs's "#ping"), defaulting to 60 (and
+ * persisting that default) if unset or out of range. */
+uint32_t modem_ws_ping_interval_s(void);
+
 /* Pulls up to `max_len` bytes received over the websocket since the last
  * call (FIFO order), removing them. Returns the number of bytes actually
  * copied into `buf` (0 if none are available, including when no websocket

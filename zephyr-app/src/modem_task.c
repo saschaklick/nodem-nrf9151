@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -687,7 +688,7 @@ static int step_websocket_connect(void)
 }
 
 /* Matches nodem-esp32's websocket_task() inner loop: a "ping,<seconds>" text
- * frame every MODEM_WS_PING_PERIOD_MS as an application-level keepalive
+ * frame every modem_ws_ping_interval_s() as an application-level keepalive
  * (catches a link that looks "connected" but has silently stopped passing
  * data, which a lower-level TCP/TLS keepalive wouldn't), plus pumping
  * ws_tx_ring/ws_rx_ring (see their doc comment) so nodem_task.c's
@@ -704,13 +705,44 @@ static int step_websocket_connect(void)
  * there - see its doc comment). Does not itself close `ws_sock`/g_tls_fd;
  * modem_task() does that once this returns, same reasoning as
  * step_websocket_connect() leaving that to its own caller. */
-#define MODEM_WS_PING_PERIOD_MS  10000
 #define MODEM_WS_RECV_TIMEOUT_MS 200
 /* Bigger than a typical command/reply, so a large "pkg" transfer's data
  * moves in fewer, larger websocket_recv_msg() calls rather than being
  * artificially chopped into many small ones each paying its own call
  * overhead - matched to MODEM_WS_RING_SIZE's own reasoning above. */
 #define MODEM_WS_RECV_BUF_SIZE   1024
+
+/* Same key, range and fallback behaviour as nodem-esp32's websocket.rs
+ * (NVS_KEY_PING_INTERVAL/PING_INTERVAL_RANGE/read_ping_interval()), just a
+ * longer default here - every ping costs LTE airtime. Re-read on every
+ * check (config_get_i32() is only a RAM lookup), so a "#ping" takes effect
+ * on the live connection right away. */
+#define MODEM_WS_PING_KEY         "ping"
+#define MODEM_WS_PING_DEFAULT_S   60
+#define MODEM_WS_PING_MIN_S       1
+#define MODEM_WS_PING_MAX_S       3600
+
+uint32_t modem_ws_ping_interval_s(void)
+{
+	/* 0 is out of range, so it doubles as the "never set" sentinel. */
+	int32_t secs = config_get_i32(MODEM_WS_PING_KEY, 0);
+
+	if (secs >= MODEM_WS_PING_MIN_S && secs <= MODEM_WS_PING_MAX_S) {
+		return (uint32_t)secs;
+	}
+
+	/* Missing (first boot) or malformed - persist the default, so "#nvs"
+	 * shows what's actually in use. */
+	if (secs != 0) {
+		warn(TAG, "malformed '%s' in config (%d), falling back to default",
+		     MODEM_WS_PING_KEY, secs);
+	}
+	if (config_set_i32(MODEM_WS_PING_KEY, MODEM_WS_PING_DEFAULT_S)) {
+		error(TAG, "failed to persist default '%s'", MODEM_WS_PING_KEY);
+	}
+
+	return MODEM_WS_PING_DEFAULT_S;
+}
 
 static enum modem_step websocket_supervise(int ws_sock)
 {
@@ -728,7 +760,8 @@ static enum modem_step websocket_supervise(int ws_sock)
 			return MODEM_STEP_PDN;
 		}
 
-		if (k_uptime_get() - last_ping >= MODEM_WS_PING_PERIOD_MS) {
+		if (k_uptime_get() - last_ping >=
+		    (int64_t)modem_ws_ping_interval_s() * MSEC_PER_SEC) {
 			last_ping = k_uptime_get();
 
 			char ping[32];
@@ -806,6 +839,10 @@ static void modem_task(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p3);
 
 	lte_lc_register_handler(lte_lc_evt_handler);
+
+	/* Persists the default ping interval on first boot, rather than only
+	 * once a websocket first connects. */
+	(void)modem_ws_ping_interval_s();
 
 	enum modem_step step = MODEM_STEP_INIT;
 
@@ -991,6 +1028,186 @@ size_t modem_status_format(char *buf, size_t buf_len)
 	return n > 0 ? (size_t)n : 0;
 }
 
+/* Current RSRP in dBm from AT+CESQ, or INT_MIN if unknown (not registered
+ * on a network yet, or the query itself failed). "+CESQ: <rxlev>,<ber>,
+ * <rscp>,<ecno>,<rsrq>,<rsrp>" - rsrp (the 6th, last field) is what maps to
+ * dBm; 0-97 valid, 255 means "not known". */
+static int modem_rsrp_dbm(void)
+{
+	char resp[48];
+
+	if (nrf_modem_at_cmd(resp, sizeof(resp), "AT+CESQ")) {
+		return INT_MIN;
+	}
+
+	const char *p = strchr(resp, ':');
+
+	for (int field = 0; field < 5 && p; field++) {
+		p = strchr(p + 1, ',');
+	}
+
+	int rsrp = p ? atoi(p + 1) : -1;
+
+	return (rsrp >= 0 && rsrp <= 97) ? rsrp - 140 : INT_MIN;
+}
+
+/* Copies the `n`th (0-based) double-quoted field of `line` (up to its end of
+ * line) into `buf`, or "" if there isn't one / it doesn't fit. */
+static void quoted_field(const char *line, int n, char *buf, size_t buf_len)
+{
+	const char *eol = strpbrk(line, "\r\n");
+	const char *start = line;
+
+	buf[0] = '\0';
+
+	for (int i = 0; i <= n; i++) {
+		start = strchr(start, '"');
+		if (!start || (eol && start > eol)) {
+			return;
+		}
+		const char *end = strchr(start + 1, '"');
+
+		if (!end || (eol && end > eol)) {
+			return;
+		}
+		if (i == n) {
+			size_t len = (size_t)(end - start - 1);
+
+			if (len < buf_len) {
+				memcpy(buf, start + 1, len);
+				buf[len] = '\0';
+			}
+			return;
+		}
+		start = end + 1;
+	}
+}
+
+/* The first STEP_ERROR step in `first`..`last` as "<step>(<err>)", or ""
+ * if none - "#stat"'s trailing error field. */
+static void step_error_str(char *buf, size_t buf_len, enum modem_step first, enum modem_step last)
+{
+	buf[0] = '\0';
+
+	for (enum modem_step step = first; step <= last; step++) {
+		if (atomic_get(&g_status[step].state) == STEP_ERROR) {
+			snprintf(buf, buf_len, "%s(%d)", step_name[step],
+				 (int)atomic_get(&g_status[step].err));
+			return;
+		}
+	}
+}
+
+size_t modem_stat_format(char *buf, size_t buf_len)
+{
+	/* Modem side (INIT..PDN): nodem-esp32's wifi line has a "waiting" for
+	 * an unconfigured network too, but there's no configuration step
+	 * here - the modem goes straight to connecting from boot. */
+	const char *modem_state = "connected";
+	char modem_err[24];
+
+	step_error_str(modem_err, sizeof(modem_err), MODEM_STEP_INIT, MODEM_STEP_PDN);
+
+	for (enum modem_step step = MODEM_STEP_INIT; step <= MODEM_STEP_PDN; step++) {
+		if (atomic_get(&g_status[step].state) != STEP_OK) {
+			modem_state = modem_err[0] != '\0' ? "failed" : "connecting";
+			break;
+		}
+	}
+
+	char apn[64] = "";
+	char ip[48] = "";
+	char quality[8] = "";
+
+	if (atomic_get(&g_pdn_up)) {
+		char resp[256];
+
+		if (!nrf_modem_at_cmd(resp, sizeof(resp), "AT+CGDCONT?")) {
+			const char *line = strstr(resp, "+CGDCONT: 0,");
+
+			if (line) {
+				quoted_field(line, 1, apn, sizeof(apn));
+				quoted_field(line, 2, ip, sizeof(ip));
+				/* Dual-stack contexts list "<ipv4> <ipv6>" -
+				 * keep just the first. */
+				char *sp = strchr(ip, ' ');
+
+				if (sp) {
+					*sp = '\0';
+				}
+			}
+		}
+
+		int dbm = modem_rsrp_dbm();
+
+		if (dbm != INT_MIN) {
+			snprintf(quality, sizeof(quality), "%d", dbm);
+		}
+	}
+
+	/* Cloud side - same precedence as modem_task() itself: a pending
+	 * reg_code always wins (even over an existing registration), then an
+	 * existing device_id, then a code the server rejected. */
+	const char *reg_state;
+	char cloud_err[24];
+	char code[REG_CODE_LEN + 1];
+
+	step_error_str(cloud_err, sizeof(cloud_err), MODEM_STEP_TLS, MODEM_STEP_WEBSOCKET);
+	config_get_str("reg_code", code, sizeof(code), "");
+
+	if (registration_pending()) {
+		reg_state = "registering";
+	} else if (device_registered()) {
+		reg_state = "registered";
+	} else if (strcmp(code, REG_CODE_REJECTED) == 0) {
+		reg_state = "failed";
+		if (cloud_err[0] == '\0') {
+			snprintf(cloud_err, sizeof(cloud_err), "rejected");
+		}
+	} else {
+		reg_state = "waiting";
+	}
+
+	const char *conn_state = "disconnected";
+
+	if (atomic_get(&g_status[MODEM_STEP_WEBSOCKET].state) == STEP_OK) {
+		conn_state = "connected";
+	} else {
+		for (enum modem_step step = MODEM_STEP_TLS; step <= MODEM_STEP_WEBSOCKET; step++) {
+			if (atomic_get(&g_status[step].state) == STEP_RUNNING) {
+				conn_state = "connecting";
+				break;
+			}
+		}
+	}
+
+	char host[CLOUD_HOST_LEN];
+	char name[REG_NAME_MAX_LEN + 1];
+
+	get_cloud_host(host, sizeof(host));
+	config_get_str("device_name", name, sizeof(name), "");
+
+	int n = snprintf(buf, buf_len,
+			 "modem,%s,%s,%s,%s,%s\r\n"
+			 "cloud,%s,%s,%s,%s,%s\r\n",
+			 modem_state, apn, ip, quality, modem_err,
+			 reg_state, conn_state, host, name, cloud_err);
+
+	return n > 0 ? (size_t)n : 0;
+}
+
+int modem_core_temp(int *temp_c)
+{
+	if (atomic_get(&g_status[MODEM_STEP_INIT].state) != STEP_OK) {
+		return -EAGAIN;
+	}
+
+	int err = nrf_modem_at_scanf("AT%XTEMP?", "%%XTEMP: %d", temp_c);
+
+	return err == 1 ? 0 : (err < 0 ? err : -EIO);
+}
+
+
 #define MODEM_STATUS_PERIOD_MS 200 /* 5 Hz */
 
 /* MODEM_STEP_REGISTER is a one-time bootstrap step: modem_task()'s
@@ -1130,29 +1347,14 @@ static void modem_status_modem_line(char *buf, size_t buf_len)
 			}
 		}
 
-		s_bars = -1;
-		if (!nrf_modem_at_cmd(resp, sizeof(resp), "AT+CESQ")) {
-			/* "+CESQ: <rxlev>,<ber>,<rscp>,<ecno>,<rsrq>,<rsrp>" - rsrp
-			 * (the 6th, last field) is what maps to dBm; 0-97 valid,
-			 * 255 means "not known". */
-			const char *p = strchr(resp, ':');
+		int dbm = modem_rsrp_dbm();
 
-			for (int field = 0; field < 5 && p; field++) {
-				p = strchr(p + 1, ',');
-			}
-
-			int rsrp = p ? atoi(p + 1) : -1;
-
-			if (rsrp >= 0 && rsrp <= 97) {
-				int dbm = rsrp - 140;
-
-				s_bars = dbm >= -80 ? 4
-					: dbm >= -90  ? 3
-					: dbm >= -100 ? 2
-					: dbm >= -110 ? 1
-					: 0;
-			}
-		}
+		s_bars = dbm == INT_MIN ? -1
+			: dbm >= -80  ? 4
+			: dbm >= -90  ? 3
+			: dbm >= -100 ? 2
+			: dbm >= -110 ? 1
+			: 0;
 	}
 
 	/* "[...|]" - 4 slots, one '|' per bar out of s_bars (0-4), '.' for the

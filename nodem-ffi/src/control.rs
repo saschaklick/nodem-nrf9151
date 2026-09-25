@@ -12,8 +12,14 @@ use nodem_rs::media::Media;
 // doc comment below.
 unsafe extern "C" {
     fn config_set_str(key: *const c_char, val: *const c_char) -> i32;
+    fn config_set_i32(key: *const c_char, val: i32) -> i32;
     fn config_list(buf: *mut c_char, buf_len: usize) -> usize;
-    fn modem_status_format(buf: *mut c_char, buf_len: usize) -> usize;
+    fn config_get_str(key: *const c_char, buf: *mut c_char, buf_len: usize, default_val: *const c_char);
+    fn display_oled_set(value: *const c_char) -> i32;
+    fn nodem_config_set(value: *const c_char) -> i32;
+    fn modem_stat_format(buf: *mut c_char, buf_len: usize) -> usize;
+    fn modem_core_temp(temp_c: *mut i32) -> i32;
+    fn modem_ws_ping_interval_s() -> u32;
     fn pkg_store_capacity() -> usize;
     fn pkg_store_erase(len: usize) -> i32;
     fn pkg_store_write(offset: usize, buf: *const u8, len: usize) -> i32;
@@ -29,6 +35,9 @@ unsafe extern "C" {
 // internally - this just avoids a C call per byte).
 const LOADER_CHUNK_LEN: usize = 512;
 
+// Zephyr's -EINVAL, as display_oled_set() returns it for a malformed value.
+const EINVAL_NEG: i32 = -22;
+
 // Matches config_store.h's MAX_KEY_LEN/MAX_STR_LEN (+1 for the NUL each C
 // call needs) - kept as separate constants here since control.rs has no way
 // to `#include` that header and assert they match at compile time.
@@ -42,6 +51,10 @@ const VAL_BUF_LEN: usize = 128;
 const REG_CODE_LEN: usize = 6;
 const DEVICE_NAME_MIN_LEN: usize = 3;
 const DEVICE_NAME_MAX_LEN: usize = 64;
+
+// Matches modem_task.c's MODEM_WS_PING_DEFAULT_S/MIN_S/MAX_S.
+const PING_DEFAULT_SECS: i32 = 60;
+const PING_INTERVAL_RANGE: core::ops::RangeInclusive<i32> = 1..=3600;
 
 /// Copies `s` into `buf` NUL-terminated, for passing to a C call. Fails
 /// (rather than silently truncating, which could target/store the wrong
@@ -68,7 +81,9 @@ enum Ret {
 /// protocol to this firmware's actual hardware. Currently: "#reg" to
 /// provision cloud registration (config_store.c's flash-backed key/value
 /// store; modem_task.c's step_register() does the actual work), "#nvs" to
-/// list that store's contents, "#stat" against modem_task.c's connection
+/// list that store's contents, "#ping" to set the websocket keepalive
+/// interval, "#oled" to configure the OLED panel, "#nodem" the
+/// framebuffer it shows, "#cfg" to show both, "#stat" against modem_task.c's connection
 /// status, and "#reset". Also receives nodem-rs's "pkg" and "ota" uploads
 /// (see the IControlLoader impl below). More of "controlling all aspects of NRF hardware"
 /// is meant to grow the same way - a small C bridge function (see
@@ -235,6 +250,28 @@ impl IControl for ZephyrControl {
                     }
                 }
             }
+            // "#ping,<seconds>" - how often the websocket pings the cloud,
+            // within PING_INTERVAL_RANGE; a bare "#ping" resets it to the
+            // default. Matches nodem-esp32's own "#ping". modem_task.c
+            // re-reads it on every check, so it applies to a live
+            // connection right away.
+            "ping" => {
+                let arg = args.trim();
+                let secs = if arg.is_empty() {
+                    Some(PING_DEFAULT_SECS)
+                } else {
+                    arg.parse().ok().filter(|s| PING_INTERVAL_RANGE.contains(s))
+                };
+
+                match secs {
+                    Some(secs) => {
+                        if unsafe { config_set_i32(c"ping".as_ptr(), secs) } != 0 {
+                            ret = Ret::Error;
+                        }
+                    }
+                    None => ret = Ret::MalformedValue,
+                }
+            }
             "nvs" => {
                 let mut buf = [0u8; 512];
                 let n = unsafe { config_list(buf.as_mut_ptr() as *mut c_char, buf.len()) };
@@ -242,14 +279,80 @@ impl IControl for ZephyrControl {
                 let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
                 let _ = res.write_str(text);
             }
+            // Same line shape as nodem-esp32's command_listener.rs "stat"
+            // (minus its wifi/oled/iled lines) - see modem_task.h's
+            // modem_stat_format() for the modem/cloud fields.
             "stat" => {
-                let mut buf = [0u8; 224];
-                let n = unsafe { modem_status_format(buf.as_mut_ptr() as *mut c_char, buf.len()) };
+                let mut temp_c: i32 = 0;
+                let temp_ok = unsafe { modem_core_temp(&mut temp_c) } == 0;
+                let _ = write!(
+                    res,
+                    "dev,{},{},",
+                    unsafe { modem_ws_ping_interval_s() },
+                    crate::heap_free(),
+                );
+                if temp_ok {
+                    let _ = write!(res, "{temp_c}");
+                }
+                let _ = res.write_str("\r\n");
+
+                let mut buf = [0u8; 512];
+                let n = unsafe { modem_stat_format(buf.as_mut_ptr() as *mut c_char, buf.len()) };
                 let n = n.min(buf.len() - 1);
-                let status = core::str::from_utf8(&buf[..n]).unwrap_or("");
-                let _ = write!(res, "modem,{status}\r\n");
+                let _ = res.write_str(core::str::from_utf8(&buf[..n]).unwrap_or(""));
             }
+            // "#oled,<protocol>:<width>:<height>:<x>:<y>[:<rotation>]" -
+            // the OLED panel, e.g. the default "ssd1306:128:64:0:0"; an
+            // empty value or another protocol disables it. See
+            // display_task.h's display_oled_set() for the format - it
+            // validates and stores it, and display_task.c reinitializes
+            // the panel with it right away. Matches nodem-esp32's "#oled".
+            "oled" => {
+                let mut value_buf = [0u8; VAL_BUF_LEN];
+                match to_cstr(args.trim(), &mut value_buf) {
+                    Some(v) => match unsafe { display_oled_set(v.as_ptr() as *const c_char) } {
+                        0 => {}
+                        EINVAL_NEG => ret = Ret::MalformedValue,
+                        _ => ret = Ret::Error,
+                    },
+                    None => ret = Ret::MalformedValue,
+                }
+            }
+            // "#nodem,<width>:<height>:<bits_per_pixel>[,<device>...]" -
+            // the nodem framebuffer's size and which part of it each
+            // output driver shows, e.g. the default "128:64:1,oled:0:0:1:1";
+            // a bare "#nodem" resets it to that default. See
+            // nodem_config.h for the format - nodem_config_set()
+            // validates and stores it, and nodem_task.c resizes the
+            // framebuffer right away. Matches nodem-esp32's "#nodem".
+            "nodem" => {
+                let mut value_buf = [0u8; VAL_BUF_LEN];
+                match to_cstr(args.trim(), &mut value_buf) {
+                    Some(v) => match unsafe { nodem_config_set(v.as_ptr() as *const c_char) } {
+                        0 => {}
+                        EINVAL_NEG => ret = Ret::MalformedValue,
+                        _ => ret = Ret::Error,
+                    },
+                    None => ret = Ret::MalformedValue,
+                }
+            }
+            // "key=value" lines of the device's configuration, same shape
+            // as nodem-esp32's "#cfg" - only the keys this firmware has.
             "cfg" => {
+                for key in [c"oled", c"nodem"] {
+                    let mut value_buf = [0u8; VAL_BUF_LEN];
+                    unsafe {
+                        config_get_str(
+                            key.as_ptr(),
+                            value_buf.as_mut_ptr() as *mut c_char,
+                            value_buf.len(),
+                            c"".as_ptr(),
+                        )
+                    };
+                    let len = value_buf.iter().position(|&b| b == 0).unwrap_or(value_buf.len());
+                    let value = core::str::from_utf8(&value_buf[..len]).unwrap_or("");
+                    let _ = write!(res, "{}={value}\r\n", key.to_str().unwrap_or(""));
+                }
             }
             _ => ret = Ret::Error,
         }
