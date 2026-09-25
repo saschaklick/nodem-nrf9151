@@ -7,18 +7,26 @@
 #include "nodem_config.h"
 
 /*
- * Copies nodem-rs's framebuffer `buf` (nodem_config_buffer_len(config)
- * bytes, row-major, MSB first - bit index = y * width + x) and the config
- * it was rendered with into the shared display buffer under lock, and
- * marks it dirty for display_task to flush to the panel on its next cycle.
- * display_task maps it onto the configured panel itself, through the
- * config's "oled" entry (see nodem_config.h) and the panel's own
- * size/offset/rotation (see display_oled_set()).
- *
- * Safe to call from any thread; the copy happens under `display_mutex` so a
- * writer never races the display task's own read of the buffer.
+ * Hands display_task nodem-rs's framebuffer `buf` (row-major, MSB first -
+ * bit index = y * width + x) and the config it's rendered with, and marks
+ * it dirty for display_task to flush to the panel on its next cycle.
+ * display_task reads `buf` in place - no copy - so it must stay valid (a
+ * later call replaces it), and every write to it must happen between
+ * display_fb_lock()/display_fb_unlock(). display_task maps it onto the
+ * configured panel itself, through the config's "oled" entry (see
+ * nodem_config.h) and the panel's own size/offset/rotation (see
+ * display_oled_set()).
  */
 void display_task_submit(const uint8_t *buf, const struct nodem_config *config);
+
+/*
+ * Held around anything that writes the framebuffer passed to
+ * display_task_submit() (a whole render, a resize) - display_task only
+ * ever reads it under the same lock, one page at a time, so a page is
+ * never built from a half-rendered frame.
+ */
+void display_fb_lock(void);
+void display_fb_unlock(void);
 
 /*
  * Validates and persists config_store's "oled" key, then has display_task

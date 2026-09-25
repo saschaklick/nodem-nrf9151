@@ -1156,16 +1156,20 @@ size_t modem_stat_format(char *buf, size_t buf_len)
 	config_get_str("reg_code", code, sizeof(code), "");
 
 	if (registration_pending()) {
-		reg_state = "registering";
+		/* Same as nodem-esp32: an attempt that failed (any step up to
+		 * and including the registration request itself, with the
+		 * failed step as the error) reports reg_failed until the next
+		 * retry starts - it's retried either way. */
+		reg_state = cloud_err[0] != '\0' ? "reg_failed" : "registering";
 	} else if (device_registered()) {
 		reg_state = "registered";
 	} else if (strcmp(code, REG_CODE_REJECTED) == 0) {
-		reg_state = "failed";
+		reg_state = "reg_failed";
 		if (cloud_err[0] == '\0') {
 			snprintf(cloud_err, sizeof(cloud_err), "rejected");
 		}
 	} else {
-		reg_state = "waiting";
+		reg_state = "no_reg";
 	}
 
 	const char *conn_state = "disconnected";

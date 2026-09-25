@@ -291,8 +291,10 @@ impl IControl for ZephyrControl {
                     unsafe { modem_ws_ping_interval_s() },
                     crate::heap_free(),
                 );
+                // One decimal, same as nodem-esp32's - AT%XTEMP? itself
+                // only reports whole degrees.
                 if temp_ok {
-                    let _ = write!(res, "{temp_c}");
+                    let _ = write!(res, "{temp_c}.0");
                 }
                 let _ = res.write_str("\r\n");
 

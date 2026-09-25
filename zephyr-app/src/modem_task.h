@@ -45,8 +45,10 @@ size_t modem_status_format(char *buf, size_t buf_len);
  *   "modem,<state>,<apn>,<ip>,<rsrp dBm>,<error>\r\n"
  *   "cloud,<registration>,<connection>,<host>,<device_name>,<error>\r\n"
  * <state> is one of connecting/connected/failed, <registration> one of
- * waiting/registering/registered/failed, <connection> one of
- * disconnected/connecting/connected - the same words nodem-esp32 uses.
+ * no_reg (no registration code provisioned yet)/registering/registered/
+ * reg_failed (the server rejected the code, or the latest attempt failed
+ * and is waiting to be retried), <connection> one of
+ * disconnected/connecting/connected.
  * Fields that aren't known yet are left empty. Queries the modem over AT
  * (AT+CGDCONT?/AT+CESQ), so only call it on demand, not periodically.
  * NUL-terminated, truncated to fit buf_len; returns the length the

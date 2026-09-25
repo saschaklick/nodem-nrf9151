@@ -338,60 +338,69 @@ static int ssd1306_init(const struct device *i2c, const struct oled_size *size,
  * fill: columns `col`..`col`+`cols`-1, pages `page`..`page`+`pages`-1. In
  * horizontal addressing mode (as ssd1306_init() sets up) the controller's
  * write pointer advances through it column by column and wraps to the next
- * page on its own, and it keeps its position between I2C transfers - so a
- * frame can go out one page per transfer without re-addressing each one. */
+ * page on its own, and it keeps its position between I2C transfers. All
+ * six command bytes go out as one transfer (control byte 0x00 = a stream
+ * of commands follows) rather than one per byte - this is sent once per
+ * changed page, so its overhead counts. */
 static int ssd1306_set_window(const struct device *i2c, uint8_t col, uint8_t cols, uint8_t page,
 			      uint8_t pages)
 {
-	int err = 0;
+	uint8_t buf[] = {
+		0x00,
+		CMD_SET_COLUMN_ADDR, col, col + cols - 1,
+		CMD_SET_PAGE_ADDR, page, page + pages - 1,
+	};
 
-	err |= write_cmd(i2c, CMD_SET_COLUMN_ADDR);
-	err |= write_cmd(i2c, col);
-	err |= write_cmd(i2c, col + cols - 1);
-
-	err |= write_cmd(i2c, CMD_SET_PAGE_ADDR);
-	err |= write_cmd(i2c, page);
-	err |= write_cmd(i2c, page + pages - 1);
-
-	return err;
+	return i2c_write(i2c, buf, sizeof(buf), SSD1306_ADDR);
 }
 
 /* One page (8 rows) of the frame - one byte per column, LSB at the top -
- * built into page_buf[1..] (page_buf[0] is the I2C data control byte) and
- * sent as a single transfer, then the next page is built into the same
- * buffer. Only ever one page in RAM, rather than the whole frame. */
+ * built into page_buf[1..], then (whatever of it changed) sent, then the
+ * next page is built into the same buffer. Only ever one page in RAM,
+ * rather than the whole frame. page_buf[0] is room for the I2C data
+ * control byte in front of column 0. */
 static uint8_t page_buf[1 + SSD1306_RAM_COLS];
 
-static int ssd1306_write_page(const struct device *i2c, uint8_t cols)
+/* What each page's columns were last sent as - page_buf is compared
+ * against this so only what actually changed goes out over I2C (see
+ * display_task()). Indexed like page_buf's data: [page][column in the
+ * draw area]. Only trusted while `sent_valid` - after a failed write or a
+ * reinit the panel's RAM contents are unknown, so the next update resends
+ * everything. */
+static uint8_t sent[SSD1306_RAM_ROWS / 8][SSD1306_RAM_COLS];
+static bool sent_valid;
+
+/* Sends columns `first`..`first`+`len`-1 of page_buf's data as a single
+ * transfer - the data control byte (0x40) goes into the byte right before
+ * them, page_buf[first] (the previous column's data, or page_buf[0]),
+ * which is saved and restored around the transfer. */
+static int ssd1306_write_page(const struct device *i2c, uint8_t first, uint8_t len)
 {
-	page_buf[0] = 0x40;
-	return i2c_write(i2c, page_buf, 1 + cols, SSD1306_ADDR);
+	uint8_t saved = page_buf[first];
+
+	page_buf[first] = 0x40;
+	int err = i2c_write(i2c, &page_buf[first], 1 + len, SSD1306_ADDR);
+
+	page_buf[first] = saved;
+	return err;
 }
 
 /* Zeroes all of display RAM, so nothing a previous config left outside the
- * new draw area can show through. */
+ * new draw area can show through - which also makes `sent` (all zeros)
+ * exactly what the panel holds. */
 static int ssd1306_clear(const struct device *i2c)
 {
 	int err = ssd1306_set_window(i2c, 0, SSD1306_RAM_COLS, 0, SSD1306_RAM_ROWS / 8);
 
 	memset(&page_buf[1], 0, SSD1306_RAM_COLS);
 	for (int pg = 0; pg < SSD1306_RAM_ROWS / 8 && !err; pg++) {
-		err = ssd1306_write_page(i2c, SSD1306_RAM_COLS);
+		err = ssd1306_write_page(i2c, 0, SSD1306_RAM_COLS);
 	}
+
+	memset(sent, 0, sizeof(sent));
+	sent_valid = err == 0;
 
 	return err;
-}
-
-/* Whether nodem framebuffer pixel (x, y) is lit - off outside it. */
-static bool fb_pixel(const uint8_t *fb, const struct nodem_config *nc, int x, int y)
-{
-	if (x < 0 || x >= nc->width || y < 0 || y >= nc->height) {
-		return false;
-	}
-
-	uint32_t bit_idx = (uint32_t)y * nc->width + x;
-
-	return fb[bit_idx / 8] & (1 << (7 - (bit_idx % 8)));
 }
 
 /* Which framebuffer coordinate driver pixel `d` (of `size` along this axis)
@@ -410,90 +419,122 @@ static int16_t map_axis(int d, int size, int fb_size, int scale, int shift)
 	return (int16_t)CLAMP(shift + q, INT16_MIN, INT16_MAX);
 }
 
-/* The latest submitted framebuffer and the config it was rendered with -
- * both only ever touched under display_mutex, which display_task() holds
- * for a whole frame's worth of page transfers (building each page straight
- * from display_buf, with no copy of its own), so a frame never mixes pages
- * from two different submits. */
-static uint8_t display_buf[NODEM_FB_MAX_SIZE];
+/* nodem_task.c's own framebuffer (no copy of it here) and the config it's
+ * rendered with - all only ever touched under display_mutex. nodem_task
+ * holds it for each whole render (display_fb_lock()), display_task() only
+ * while building one page at a time, releasing it for each page's I2C
+ * transfer - so every page comes from a completely rendered frame and
+ * rendering never waits on the bus, but consecutive pages of one panel
+ * update can come from consecutive frames. */
+static const uint8_t *display_fb;
 static struct nodem_config display_nodem;
 K_MUTEX_DEFINE(display_mutex);
 static atomic_t display_dirty = ATOMIC_INIT(0);
 
+void display_fb_lock(void)
+{
+	k_mutex_lock(&display_mutex, K_FOREVER);
+}
+
+void display_fb_unlock(void)
+{
+	k_mutex_unlock(&display_mutex);
+}
+
 void display_task_submit(const uint8_t *buf, const struct nodem_config *config)
 {
-	uint32_t len = nodem_config_buffer_len(config);
-
-	if (len > NODEM_FB_MAX_SIZE) {
-		return;
-	}
-
-	/* Skipped rather than waited for while display_task() is mid-frame -
-	 * nodem_task.c submits every render cycle, so the next one simply
-	 * goes out instead, and nodem_task never stalls on the I2C bus. */
-	if (k_mutex_lock(&display_mutex, K_NO_WAIT) != 0) {
-		return;
-	}
-	memcpy(display_buf, buf, len);
+	k_mutex_lock(&display_mutex, K_FOREVER);
+	display_fb = buf;
 	display_nodem = *config;
 	k_mutex_unlock(&display_mutex);
 
 	atomic_set(&display_dirty, 1);
 }
 
-/* Per-frame state build_page() maps through - set up once per frame by
- * frame_prepare(), from the panel config and display_nodem. */
+/* Everything build_page() maps through, rebuilt by frame_prepare() only
+ * when the panel config or display_nodem actually changed. */
 static struct {
+	bool valid;
+	/* What the tables below were built from. */
+	struct oled_config oc;
+	uint16_t fb_width;
+	uint16_t fb_height;
+	struct nodem_mapping map;
+
 	bool transposed;
 	/* The driver's output size as nodem sees it - swapped when
 	 * transposed. */
 	int view_w;
 	int view_h;
-	/* 0/1 - which half of the fallback frame's dots is lit. */
-	int phase;
-	/* Framebuffer coordinate per panel column/row - along the
-	 * framebuffer's x or y axis respectively, or the other way round
-	 * when transposed. */
-	int16_t by_col[SSD1306_RAM_COLS];
-	int16_t by_row[SSD1306_RAM_ROWS];
+	/* Per panel column/row, the bit offset it contributes to a
+	 * framebuffer pixel's bit index (y * width + x): x for columns and
+	 * y * width for rows - or the other way round when transposed - so
+	 * a pixel's bit index is just col_bit[px] + row_bit[py]. -1 where
+	 * the column/row falls outside the framebuffer (reads as off),
+	 * which settles bounds and rotation up front, once, instead of per
+	 * pixel. */
+	int32_t col_bit[SSD1306_RAM_COLS];
+	int32_t row_bit[SSD1306_RAM_ROWS];
 } fm;
 
-/* Call with display_mutex held. */
+/* The bit offset framebuffer coordinate `v` contributes along an axis of
+ * `size` pixels, each `stride` bits apart - or -1 outside it. */
+static int32_t axis_bit(int v, int size, int stride)
+{
+	return v >= 0 && v < size ? (int32_t)v * stride : -1;
+}
+
+/* Call with display_mutex held - checked for every page, since the config
+ * can change between two pages of one panel update. */
 static void frame_prepare(const struct oled_config *oc)
 {
 	const struct nodem_config *nc = &display_nodem;
 	const struct nodem_mapping *m = &nc->oled;
 
+	if (fm.valid && fm.oc.width == oc->width && fm.oc.height == oc->height &&
+	    fm.oc.rotation == oc->rotation && fm.fb_width == nc->width &&
+	    fm.fb_height == nc->height && fm.map.present == m->present && fm.map.x == m->x &&
+	    fm.map.y == m->y && fm.map.scale_x == m->scale_x && fm.map.scale_y == m->scale_y) {
+		return;
+	}
+
+	fm.valid = true;
+	fm.oc = *oc;
+	fm.fb_width = nc->width;
+	fm.fb_height = nc->height;
+	fm.map = *m;
+
 	fm.transposed = rotation_transposes(oc->rotation);
 	fm.view_w = fm.transposed ? oc->height : oc->width;
 	fm.view_h = fm.transposed ? oc->width : oc->height;
-	fm.phase = (int)((k_uptime_get() / MSEC_PER_SEC) % 2);
 
 	if (!m->present) {
 		return;
 	}
 
+	int w = nc->width;
+	int h = nc->height;
+
 	for (int c = 0; c < oc->width; c++) {
-		fm.by_col[c] = fm.transposed
-			       ? map_axis(c, fm.view_h, nc->height, m->scale_y, m->y)
-			       : map_axis(c, fm.view_w, nc->width, m->scale_x, m->x);
+		fm.col_bit[c] =
+			fm.transposed
+				? axis_bit(map_axis(c, fm.view_h, h, m->scale_y, m->y), h, w)
+				: axis_bit(map_axis(c, fm.view_w, w, m->scale_x, m->x), w, 1);
 	}
 	for (int r = 0; r < oc->height; r++) {
-		fm.by_row[r] = fm.transposed
-			       ? map_axis(r, fm.view_w, nc->width, m->scale_x, m->x)
-			       : map_axis(r, fm.view_h, nc->height, m->scale_y, m->y);
+		fm.row_bit[r] =
+			fm.transposed
+				? axis_bit(map_axis(r, fm.view_w, w, m->scale_x, m->x), w, 1)
+				: axis_bit(map_axis(r, fm.view_h, h, m->scale_y, m->y), h, w);
 	}
 }
 
-/* Builds page `pg` of the frame for panel columns skip..skip+cols-1 into
- * page_buf, through the nodem config's "oled" mapping (or the fallback
- * frame, without one). Rows and columns of the panel swap roles for a
- * transposed (90/270) rotation - the one part of it the controller can't
- * do itself. Call with display_mutex held, after frame_prepare(). */
-static void build_page(uint8_t skip, uint8_t cols, int pg)
+/* nodem-esp32's DriverView::fallback_pixel() for a driver without a
+ * mapping: every other pixel around the edge, which ones alternating once
+ * a second. */
+static void build_fallback_page(uint8_t skip, uint8_t cols, int pg)
 {
-	const struct nodem_config *nc = &display_nodem;
-	bool mapped = nc->oled.present;
+	int phase = (int)((k_uptime_get() / MSEC_PER_SEC) % 2);
 
 	for (int c = 0; c < cols; c++) {
 		int px = skip + c;
@@ -501,25 +542,66 @@ static void build_page(uint8_t skip, uint8_t cols, int pg)
 
 		for (int b = 0; b < 8; b++) {
 			int py = pg * 8 + b;
-			bool on;
+			int vx = fm.transposed ? py : px;
+			int vy = fm.transposed ? px : py;
+			bool edge = vx == 0 || vy == 0 || vx == fm.view_w - 1 || vy == fm.view_h - 1;
 
-			if (mapped) {
-				on = fm.transposed
-				     ? fb_pixel(display_buf, nc, fm.by_row[py], fm.by_col[px])
-				     : fb_pixel(display_buf, nc, fm.by_col[px], fm.by_row[py]);
-			} else {
-				/* nodem-esp32's DriverView::fallback_pixel():
-				 * every other pixel around the edge, which
-				 * ones alternating once a second. */
-				int vx = fm.transposed ? py : px;
-				int vy = fm.transposed ? px : py;
-				bool edge = vx == 0 || vy == 0 || vx == fm.view_w - 1 ||
-					    vy == fm.view_h - 1;
-
-				on = edge && (vx + vy + fm.phase) % 2 == 0;
-			}
-			if (on) {
+			if (edge && (vx + vy + phase) % 2 == 0) {
 				byte |= BIT(b);
+			}
+		}
+		page_buf[1 + c] = byte;
+	}
+}
+
+/* Builds page `pg` of the frame for panel columns skip..skip+cols-1 into
+ * page_buf, through the nodem config's "oled" mapping (or the fallback
+ * frame, without one). Rows and columns of the panel swap roles for a
+ * transposed (90/270) rotation - the one part of it the controller can't
+ * do itself - which frame_prepare()'s tables already account for. Call
+ * with display_mutex held, after frame_prepare(). */
+static void build_page(uint8_t skip, uint8_t cols, int pg)
+{
+	if (!display_nodem.oled.present) {
+		build_fallback_page(skip, cols, pg);
+		return;
+	}
+
+	/* This page's 8 rows, loaded once for all its columns; the ones
+	 * outside the framebuffer are dropped here rather than checked per
+	 * pixel. */
+	int32_t rows[8];
+	uint8_t row_mask[8];
+	int n = 0;
+
+	for (int b = 0; b < 8; b++) {
+		int32_t r = fm.row_bit[pg * 8 + b];
+
+		if (r >= 0) {
+			rows[n] = r;
+			row_mask[n] = BIT(b);
+			n++;
+		}
+	}
+
+	if (n == 0) {
+		memset(&page_buf[1], 0, cols);
+		return;
+	}
+
+	const uint8_t *fb = display_fb;
+
+	for (int c = 0; c < cols; c++) {
+		int32_t col = fm.col_bit[skip + c];
+		uint8_t byte = 0;
+
+		if (col >= 0) {
+			for (int i = 0; i < n; i++) {
+				uint32_t bit = (uint32_t)(col + rows[i]);
+
+				if (fb[bit >> 3] & (0x80 >> (bit & 7))) {
+					byte |= row_mask[i];
+				}
 			}
 		}
 		page_buf[1 + c] = byte;
@@ -563,6 +645,7 @@ static void display_task(void *p1, void *p2, void *p3)
 				warn(TAG, "ssd1306 switch-off failed");
 			}
 			initialized = false;
+			sent_valid = false;
 
 			if (oled_config_read(&config)) {
 				const struct oled_size *size =
@@ -609,15 +692,53 @@ static void display_task(void *p1, void *p2, void *p3)
 		if (initialized && atomic_cas(&display_dirty, 1, 0)) {
 			int err = 0;
 
-			if (cols > 0 && pages > 0) {
+			/* Every page is built, but only sent if it differs
+			 * from what the panel already shows (`sent`) - and
+			 * then only from its first to its last changed
+			 * column. A static screen costs no I2C traffic at
+			 * all. */
+			for (int pg = 0; pg < pages && cols > 0 && !err; pg++) {
 				k_mutex_lock(&display_mutex, K_FOREVER);
-				frame_prepare(&config);
-				err = ssd1306_set_window(i2c, col, cols, 0, pages);
-				for (int pg = 0; pg < pages && !err; pg++) {
+				if (display_fb) {
+					frame_prepare(&config);
 					build_page(skip, cols, pg);
-					err = ssd1306_write_page(i2c, cols);
+				} else {
+					memset(&page_buf[1], 0, cols);
 				}
 				k_mutex_unlock(&display_mutex);
+
+				const uint8_t *data = &page_buf[1];
+				int first = 0;
+				int last = cols - 1;
+
+				if (sent_valid) {
+					while (first < cols && data[first] == sent[pg][first]) {
+						first++;
+					}
+					if (first == cols) {
+						continue;
+					}
+					while (data[last] == sent[pg][last]) {
+						last--;
+					}
+				}
+
+				uint8_t len = last - first + 1;
+
+				err = ssd1306_set_window(i2c, col + first, len, pg, 1);
+				if (!err) {
+					err = ssd1306_write_page(i2c, first, len);
+				}
+				if (!err) {
+					memcpy(&sent[pg][first], &data[first], len);
+				}
+			}
+
+			/* Only once every page has gone out - a frame that
+			 * stopped partway (err) leaves it false, so the next
+			 * one resends everything. */
+			if (!err && cols > 0) {
+				sent_valid = true;
 			}
 
 			/* Same as nodem-esp32's run_ssd1306(): a failed
@@ -625,6 +746,7 @@ static void display_task(void *p1, void *p2, void *p3)
 			 * config changes; a failed flush reinitializes, and
 			 * the next frame tries again. */
 			if (err) {
+				sent_valid = false;
 				err = ssd1306_init(
 					i2c, oled_size_find(config.width, config.height), &config);
 				error(TAG, "ssd1306 write failed, reinitialized err=%d", err);

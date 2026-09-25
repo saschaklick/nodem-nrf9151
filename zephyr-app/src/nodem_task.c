@@ -19,7 +19,9 @@
 #define TAG "nodem"
 
 /* Sized for the largest framebuffer nodem_config.h allows - only the
- * first nodem_config_buffer_len() bytes of it are in use at any time. */
+ * first nodem_config_buffer_len() bytes of it are in use at any time.
+ * display_task.c reads it in place (see display_task_submit()), so every
+ * write to it - each render, a resize - happens under display_fb_lock(). */
 static uint8_t nodem_fb[NODEM_FB_MAX_SIZE];
 /* Level comes from nodem-rs's `log` crate at runtime (INFO/WARN/ERROR/...),
  * so this can't go through the fixed-level info()/warn()/error() macros -
@@ -64,8 +66,13 @@ static void nodem_process_uart(void *runtime)
 	}
 
 	size_t out_len = 0;
+
+	/* Under display_fb_lock() - nodem-rs's surface commands ("c", "p",
+	 * "r", ...) draw straight into the framebuffer display_task reads. */
+	display_fb_lock();
 	size_t consumed = nodem_process_command(runtime, cmd_buf, cmd_buf_len, cmd_out,
 						 sizeof(cmd_out), &out_len);
+	display_fb_unlock();
 
 	if (out_len > 0) {
 		log_bytes(TAG, "tx", cmd_out, out_len);
@@ -121,8 +128,12 @@ static void nodem_process_ws(void *runtime)
 	}
 
 	size_t out_len = 0;
+
+	/* See nodem_process_uart()'s note on display_fb_lock(). */
+	display_fb_lock();
 	size_t consumed = nodem_process_command(runtime, ws_cmd_buf, ws_cmd_buf_len, ws_cmd_out,
 						 sizeof(ws_cmd_out), &out_len);
+	display_fb_unlock();
 
 	if (out_len > 0) {
 		log_bytes(TAG, "ws tx", ws_cmd_out, out_len);
@@ -242,10 +253,12 @@ static void nodem_task(void *p1, void *p2, void *p3)
 
 				if (next.width != nodem.width || next.height != nodem.height ||
 				    next.bits_per_pixel != nodem.bits_per_pixel) {
+					display_fb_lock();
 					memset(nodem_fb, 0, sizeof(nodem_fb));
 					nodem_runtime_resize(runtime, nodem_fb,
 							     nodem_config_buffer_len(&next), next.width,
 							     next.height);
+					display_fb_unlock();
 					info(TAG, "framebuffer resized to %ux%u", next.width,
 					     next.height);
 				}
@@ -261,7 +274,9 @@ static void nodem_task(void *p1, void *p2, void *p3)
 			k_sem_take(&nodem_rx_sem, K_MSEC(remaining));
 		}		
 		
+		display_fb_lock();
 		nodem_runtime_run(runtime);
+		display_fb_unlock();
 
 		if (!pkg_loaded) {
 			pkg_loaded = true;
@@ -292,15 +307,17 @@ static void nodem_task(void *p1, void *p2, void *p3)
 					uint8_t discard[32];
 					size_t discard_len = 0;
 
+					display_fb_lock();
 					nodem_process_command(runtime, (const uint8_t *)cmd,
 							       (size_t)cmd_len, discard,
 							       sizeof(discard), &discard_len);
+					display_fb_unlock();
 				}
 			}
 		}
 
 		/* display_task maps this onto the configured panel itself
-		 * (see display_oled_set()). */
+		 * (see display_oled_set()), reading it in place. */
 		display_task_submit(nodem_fb, &nodem);
 	}
 }
