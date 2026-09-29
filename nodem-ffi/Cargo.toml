@@ -8,7 +8,7 @@ publish = false
 crate-type = ["staticlib"]
 
 [dependencies]
-nodem-rs = { git = "https://github.com/saschaklick/nodem-rs", features = ["base", "alloc", "runtime"] }
+nodem-rs = { git = "https://github.com/saschaklick/nodem-rs", features = ["base", "alloc", "runtime", "vm"] }
 embedded-alloc = "0.6"
 critical-section = { version = "1.2", features = ["restore-state-u32"] }
 log = "0.4"
@@ -24,7 +24,6 @@ log = "0.4"
 # an editor) intentionally gets the crate's unrestricted default instead of
 # silently picking one of these for you.
 [features]
-std = []
 log-debug = ["log/max_level_debug"]
 log-info = ["log/max_level_info"]
 log-warn = ["log/max_level_warn"]
