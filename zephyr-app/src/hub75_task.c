@@ -754,6 +754,25 @@ static uint8_t shift_buf;
 
 static bool running;
 
+/* Set by hub75_isr() when it can't keep the panel going - see
+ * hub75_overload_trip() - for hub75_task() to stop it and say why. */
+#define OVERLOAD_NONE    0
+#define OVERLOAD_OVERRUN 1
+#define OVERLOAD_STUCK   2
+static atomic_t hub75_overload = ATOMIC_INIT(OVERLOAD_NONE);
+/* Rows in a row whose render didn't finish before the next row had already
+ * been shifted out (so the next interrupt was due before this one ended). */
+static uint16_t overruns;
+#define OVERRUN_LIMIT 32
+/* What hub75_task() does about a trip - see there. */
+#define OVERLOAD_RESTART_MS 200
+#define OVERLOAD_TRIPS      3
+#define OVERLOAD_WINDOW_MS  10000
+/* How many times hub75_isr() checks for PWM_B to have stopped too before
+ * giving up - it's never more than a tick or two behind PWM_A, so this is
+ * far beyond anything legitimate (some 100us). */
+#define STOP_SPIN_LIMIT 2000
+
 static void pins_set(uint32_t mask)
 {
 	NRF_P0->OUTSET = mask;
@@ -1324,13 +1343,28 @@ static void shift_start(void)
 	nrf_pwm_task_trigger(PWM_B, NRF_PWM_TASK_SEQSTART0);
 }
 
+/* The interrupt can't keep the panel going: switch itself off - so it can
+ * never take every cycle there is, which at priority 1 would starve every
+ * thread, the command handler included, and with the config persisted, at
+ * every boot - and leave the rest to hub75_task(). */
+static void hub75_overload_trip(atomic_val_t why)
+{
+	irq_disable(DT_IRQN(PWM_A_NODE));
+	atomic_set(&hub75_overload, why);
+	k_sem_give(&hub75_wake);
+}
+
 static void hub75_isr(const void *arg)
 {
 	ARG_UNUSED(arg);
 
 	/* PWM_B was started a few cycles after PWM_A, so it can still be in
 	 * its last (idle) period - never more than a tick or two. */
-	while (!nrf_pwm_event_check(PWM_B, NRF_PWM_EVENT_STOPPED)) {
+	for (int spin = 0; !nrf_pwm_event_check(PWM_B, NRF_PWM_EVENT_STOPPED); spin++) {
+		if (spin >= STOP_SPIN_LIMIT) {
+			hub75_overload_trip(OVERLOAD_STUCK);
+			return;
+		}
 	}
 
 	/* Both stopped, so OE is back on its GPIO level - high, blanked -
@@ -1351,6 +1385,18 @@ static void hub75_isr(const void *arg)
 	shift_buf ^= 1;
 	shift_start();
 	render_row(shift_buf ^ 1, (shift_row + 1) % scan_rows);
+
+	/* Stopped again already: rendering took longer than shifting a row,
+	 * so this interrupt is due again the moment it returns - once is a
+	 * hiccup (a long higher-priority interrupt), every row means it can't
+	 * keep up. */
+	if (nrf_pwm_event_check(PWM_A, NRF_PWM_EVENT_STOPPED)) {
+		if (++overruns >= OVERRUN_LIMIT) {
+			hub75_overload_trip(OVERLOAD_OVERRUN);
+		}
+	} else {
+		overruns = 0;
+	}
 }
 
 static void pwm_setup(NRF_PWM_Type *pwm, const uint32_t pins[NRF_PWM_CHANNEL_COUNT],
@@ -1419,6 +1465,13 @@ static void hub75_stop(void)
 	nrf_pwm_disable(PWM_B);
 	nrf_pwm_pins_set(PWM_A, unconnected);
 	nrf_pwm_pins_set(PWM_B, unconnected);
+	/* Nothing left over for the next hub75_start() to trip over: no
+	 * "stopped" events (they'd fire its interrupt the moment it's
+	 * enabled, before the new config's first row is even started), no
+	 * interrupt pending. */
+	nrf_pwm_int_set(PWM_A, 0);
+	nrf_pwm_event_clear(PWM_A, NRF_PWM_EVENT_STOPPED);
+	nrf_pwm_event_clear(PWM_B, NRF_PWM_EVENT_STOPPED);
 	NVIC_ClearPendingIRQ(DT_IRQN(PWM_A_NODE));
 
 	for (size_t i = 0; i < NRF_PWM_CHANNEL_COUNT; i++) {
@@ -1569,6 +1622,10 @@ static void hub75_start(const struct hub75_config *c)
 	pwm_setup(PWM_A, pins_a, 0, top, (const uint16_t *)seq_a[0]);
 	pwm_setup(PWM_B, pins_b, BIT(PIN_OE), top, (const uint16_t *)seq_b[0]);
 
+	overruns = 0;
+	atomic_set(&hub75_overload, OVERLOAD_NONE);
+	nrf_pwm_event_clear(PWM_A, NRF_PWM_EVENT_STOPPED);
+	nrf_pwm_event_clear(PWM_B, NRF_PWM_EVENT_STOPPED);
 	nrf_pwm_int_set(PWM_A, NRF_PWM_INT_STOPPED_MASK);
 	irq_enable(DT_IRQN(PWM_A_NODE));
 
@@ -1604,6 +1661,11 @@ static void hub75_task(void *p1, void *p2, void *p3)
 	bool showing_nodem = false;
 	int fallback_phase = -1;
 	int64_t next_fx = 0;
+	/* Overload trips (see hub75_isr()): when to restart the panel (0:
+	 * not), and how many trips since trip_window. */
+	int64_t restart_at = 0;
+	int64_t trip_window = 0;
+	int trips = 0;
 
 	while (true) {
 		if (atomic_get(&hub75_generation) != generation) {
@@ -1623,10 +1685,55 @@ static void hub75_task(void *p1, void *p2, void *p3)
 			showing_nodem = false;
 			fallback_phase = -1;
 			atomic_set(&nodem_dirty, 1);
+			restart_at = 0;
+			trips = 0;
+		}
+
+		atomic_val_t overload = atomic_set(&hub75_overload, OVERLOAD_NONE);
+		int64_t now = k_uptime_get();
+
+		/* A trip is usually transient - code runs from flash, so every
+		 * flash write (a config_store save: any "#" command that
+		 * persists something, a page change's "last_page") stalls the
+		 * ISR mid-render, which a config with little slack (a long
+		 * chain at a high pixel clock) can't absorb. So the panel comes
+		 * back by itself after OVERLOAD_RESTART_MS - unless it keeps
+		 * tripping (OVERLOAD_TRIPS within OVERLOAD_WINDOW_MS): then it
+		 * stays off until the config changes. */
+		if (overload != OVERLOAD_NONE && running) {
+			const char *why = overload == OVERLOAD_STUCK
+						  ? "PWM2 never stopped"
+						  : "rendering couldn't keep up with shifting";
+
+			hub75_stop();
+			if (now - trip_window > OVERLOAD_WINDOW_MS) {
+				trip_window = now;
+				trips = 0;
+			}
+			if (++trips >= OVERLOAD_TRIPS) {
+				restart_at = 0;
+				error(TAG, "%s %d times in %ds - panel stopped until the config "
+				      "changes (try a lower pixel clock or a shorter chain: %u columns "
+				      "at %ukHz now)",
+				      why, trips, OVERLOAD_WINDOW_MS / MSEC_PER_SEC, chain_len,
+				      PWM_BASE_KHZ / pwm_top);
+			} else {
+				restart_at = now + OVERLOAD_RESTART_MS;
+				warn(TAG, "%s - restarting the panel", why);
+			}
+		}
+		if (!running && restart_at && now >= restart_at) {
+			struct hub75_config config = active;
+
+			restart_at = 0;
+			hub75_start(&config);
+			showing_nodem = false;
+			fallback_phase = -1;
+			atomic_set(&nodem_dirty, 1);
 		}
 
 		/* -1: until woken. */
-		int64_t wait_ms = -1;
+		int64_t wait_ms = restart_at ? MAX(restart_at - now, 0) : -1;
 
 		if (running) {
 			/* Shifting, latching and refreshing all run off the
@@ -1634,7 +1741,7 @@ static void hub75_task(void *p1, void *p2, void *p3)
 			 * changed nodem frame, every FX_FRAME_MS while a
 			 * colour is an effect that moves, once a second for
 			 * the fallback. */
-			int64_t now = k_uptime_get();
+			now = k_uptime_get();
 			bool animate = false;
 
 			if (effect_in_use()) {
