@@ -9,7 +9,7 @@ use core::slice;
 
 use embedded_alloc::LlffHeap as Heap;
 use nodem_rs::media;
-use nodem_rs::runtime::{Runtime, DOM, PKG_SYS};
+use nodem_rs::runtime::{Runtime, Env, PKG_SYS};
 
 mod control;
 use control::ZephyrControl;
@@ -20,7 +20,7 @@ use control::ZephyrControl;
 #[global_allocator]
 static HEAP: Heap = Heap::empty();
 
-// Measured peak on the device is ~1.2KB (the boxed DOM, plus runtime text
+// Measured peak on the device is ~1.2KB (the boxed Env, plus runtime text
 // contents); ~6KB worst case with a 4KB "xml=" page over the websocket.
 const HEAP_SIZE: usize = 8 * 1024;
 static mut HEAP_MEM: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
@@ -167,21 +167,21 @@ pub extern "C" fn nodem_runtime_new(fb_ptr: *mut u8, fb_len: usize, width: u16, 
     ensure_heap();
     ensure_logger();
     let fb = unsafe { slice::from_raw_parts_mut(fb_ptr, fb_len) };
-    let dom = Box::new(DOM::new(fb, width, height));
+    let dom = Box::new(Env::new(fb, width, height));
     Box::into_raw(dom) as *mut c_void
 }
 
 /// Points `handle`'s `Surface` at `fb_ptr`/`fb_len`, a `width` x `height`
 /// framebuffer (same rules as `nodem_runtime_new`'s) - how nodem_task.c
 /// applies a "#nodem" size change live, same as nodem-esp32's
-/// `Global::resize_display`. The DOM re-renders everything every frame, so
+/// `Global::resize_display`. The Env re-renders everything every frame, so
 /// the next `nodem_runtime_run()` draws the current page at the new size.
 #[unsafe(no_mangle)]
 pub extern "C" fn nodem_runtime_resize(handle: *mut c_void, fb_ptr: *mut u8, fb_len: usize, width: u16, height: u16) {
     if handle.is_null() {
         return;
     }
-    let dom = unsafe { &mut *(handle as *mut DOM<'static>) };
+    let dom = unsafe { &mut *(handle as *mut Env<'static>) };
     let fb = core::ptr::slice_from_raw_parts_mut(fb_ptr, fb_len);
     dom.surface.resize(fb, width, height);
 }
@@ -217,7 +217,7 @@ pub extern "C" fn nodem_runtime_resize(handle: *mut c_void, fb_ptr: *mut u8, fb_
 /// Returns whether a package was actually loaded.
 #[unsafe(no_mangle)]
 pub extern "C" fn nodem_load_pkg(handle: *mut c_void) -> bool {
-    let dom = unsafe { &mut *(handle as *mut DOM) };
+    let dom = unsafe { &mut *(handle as *mut Env) };
     let size = load_pkg(dom);
 
     // Same as nodem-esp32's load_pkg_partition(): with no pkg loaded from
@@ -228,7 +228,7 @@ pub extern "C" fn nodem_load_pkg(handle: *mut c_void) -> bool {
     // earlier is stale either way.
     //
     // Then nodem-rs's built-in system pkg is loaded again, exactly as
-    // `DOM::run()` does on its first frame (source 0): unloading keeps
+    // `Env::run()` does on its first frame (source 0): unloading keeps
     // source 0's libraries, but whatever the failed load touched (e.g. the
     // single `meta` slot, shared by all sources) may no longer be its, so
     // this puts the device back in the same state as a fresh boot with no
@@ -249,7 +249,7 @@ pub extern "C" fn nodem_load_pkg(handle: *mut c_void) -> bool {
 
 /// The actual load - see `nodem_load_pkg`. The loaded pkg's size in bytes,
 /// or 0 if none loaded.
-fn load_pkg(dom: &mut DOM) -> usize {
+fn load_pkg(dom: &mut Env) -> usize {
 
     let mut capacity: usize = 0;
     let ptr = unsafe { pkg_store_data(&raw mut capacity) };
@@ -281,7 +281,7 @@ fn load_pkg(dom: &mut DOM) -> usize {
     }
 
     // Source 1: a permanently (flash-)stored package. Source 0 is
-    // nodem-rs's own built-in PKG_SYS, loaded separately by DOM::run() on
+    // nodem-rs's own built-in PKG_SYS, loaded separately by Env::run() on
     // its first frame; source 2 is nodem-rs core's own default
     // IControlLoader (control/media.rs's `impl IControlLoader for Surface`,
     // backed by a RAM-only buffer) - not this one, which persists across
@@ -304,15 +304,15 @@ fn load_pkg(dom: &mut DOM) -> usize {
 /// the display driver afterward.
 #[unsafe(no_mangle)]
 pub extern "C" fn nodem_runtime_run(handle: *mut c_void) -> bool {
-    let dom = unsafe { &mut *(handle as *mut DOM) };
+    let dom = unsafe { &mut *(handle as *mut Env) };
     dom.run()
 }
 
 // Backs `nodem_status_message_set` below - copied into, not borrowed from,
-// the caller's memory: `DOM::status_message` (nodem-rs's runtime.rs) has to
+// the caller's memory: `Env::status_message` (nodem-rs's runtime.rs) has to
 // stay valid across every subsequent nodem_runtime_run() call, long after
 // this call's own arguments go out of scope on the C side. Only one message
-// is ever shown at a time (matches DOM's own `Option<&str>` field), so a
+// is ever shown at a time (matches Env's own `Option<&str>` field), so a
 // single static buffer is enough - no need for anything fancier. `nodem_*`
 // functions are only ever called from nodem_task's one thread (see this
 // file's other `static mut`s), so this needs no additional synchronization.
@@ -321,7 +321,7 @@ static mut STATUS_MESSAGE_BUF: [u8; STATUS_MESSAGE_BUF_SIZE] = [0; STATUS_MESSAG
 
 /// Sets the runtime's status message - a short popup nodem-rs draws centered
 /// on screen every frame while set (see runtime.rs's RuntimePrivate::popup(),
-/// called from DOM::run()). A new call replaces whatever was set before, it
+/// called from Env::run()). A new call replaces whatever was set before, it
 /// doesn't queue. Returns false (message left unset/unchanged) if `text_len`
 /// is too long for STATUS_MESSAGE_BUF_SIZE or isn't valid UTF-8, rather than
 /// truncating into a possibly-corrupt string.
@@ -340,7 +340,7 @@ pub extern "C" fn nodem_status_message_set(
         return false;
     };
 
-    let dom = unsafe { &mut *(handle as *mut DOM) };
+    let dom = unsafe { &mut *(handle as *mut Env) };
 
     unsafe {
         let buf: &'static mut [u8; STATUS_MESSAGE_BUF_SIZE] = &mut *(&raw mut STATUS_MESSAGE_BUF);
@@ -360,7 +360,7 @@ pub extern "C" fn nodem_status_message_set(
 /// nothing is drawn for it from the next frame onward.
 #[unsafe(no_mangle)]
 pub extern "C" fn nodem_status_message_clear(handle: *mut c_void) {
-    let dom = unsafe { &mut *(handle as *mut DOM) };
+    let dom = unsafe { &mut *(handle as *mut Env) };
     dom.status_message = None;
 }
 
@@ -371,7 +371,7 @@ pub extern "C" fn nodem_status_message_clear(handle: *mut c_void) {
 /// transfer is still running.
 #[unsafe(no_mangle)]
 pub extern "C" fn nodem_loader_active(handle: *mut c_void) -> bool {
-    let dom = unsafe { &*(handle as *const DOM) };
+    let dom = unsafe { &*(handle as *const Env) };
     dom.control.as_ref().is_some_and(|control| control.get_loader_progress(1).is_some())
 }
 
@@ -387,7 +387,7 @@ pub extern "C" fn nodem_process_command(
     output_cap: usize,
     output_len: *mut usize,
 ) -> usize {
-    let dom = unsafe { &mut *(handle as *mut DOM) };
+    let dom = unsafe { &mut *(handle as *mut Env) };
     let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
     let output = unsafe { slice::from_raw_parts_mut(output_ptr, output_cap) };
 

@@ -16,6 +16,7 @@ unsafe extern "C" {
     fn config_list(buf: *mut c_char, buf_len: usize) -> usize;
     fn config_get_str(key: *const c_char, buf: *mut c_char, buf_len: usize, default_val: *const c_char);
     fn display_oled_set(value: *const c_char) -> i32;
+    fn hub75_config_set(value: *const c_char) -> i32;
     fn nodem_config_set(value: *const c_char) -> i32;
     fn modem_stat_format(buf: *mut c_char, buf_len: usize) -> usize;
     fn modem_core_temp(temp_c: *mut i32) -> i32;
@@ -35,7 +36,8 @@ unsafe extern "C" {
 // internally - this just avoids a C call per byte).
 const LOADER_CHUNK_LEN: usize = 512;
 
-// Zephyr's -EINVAL, as display_oled_set() returns it for a malformed value.
+// Zephyr's -EINVAL, as display_oled_set()/hub75_config_set() return it for
+// a malformed value.
 const EINVAL_NEG: i32 = -22;
 
 // Matches config_store.h's MAX_KEY_LEN/MAX_STR_LEN (+1 for the NUL each C
@@ -82,8 +84,10 @@ enum Ret {
 /// provision cloud registration (config_store.c's flash-backed key/value
 /// store; modem_task.c's step_register() does the actual work), "#nvs" to
 /// list that store's contents, "#ping" to set the websocket keepalive
-/// interval, "#oled" to configure the OLED panel, "#nodem" the
-/// framebuffer it shows, "#cfg" to show both, "#stat" against modem_task.c's connection
+/// interval, "#status" to show or hide the on-screen connection status,
+/// "#oled" to configure the OLED panel, "#hub75" the HUB75 LED
+/// matrix, "#nodem" the framebuffer they show, "#cfg" to show all three,
+/// "#stat" against modem_task.c's connection
 /// status, and "#reset". Also receives nodem-rs's "pkg" and "ota" uploads
 /// (see the IControlLoader impl below). More of "controlling all aspects of NRF hardware"
 /// is meant to grow the same way - a small C bridge function (see
@@ -272,6 +276,28 @@ impl IControl for ZephyrControl {
                     None => ret = Ret::MalformedValue,
                 }
             }
+            // "#status,<0|1>" - whether modem_task.c's connection status
+            // overlay (the two-line modem/cloud message nodem shows on
+            // screen until everything's connected) is shown at all; a bare
+            // "#status" goes back to the default, shown. Persisted as
+            // config_store's "status" and picked up within ~200ms (see
+            // modem_status_task()) - no restart needed. nRF-only.
+            "status" => {
+                let show = match args.trim() {
+                    "" | "1" => Some(1),
+                    "0" => Some(0),
+                    _ => None,
+                };
+
+                match show {
+                    Some(show) => {
+                        if unsafe { config_set_i32(c"status".as_ptr(), show) } != 0 {
+                            ret = Ret::Error;
+                        }
+                    }
+                    None => ret = Ret::MalformedValue,
+                }
+            }
             "nvs" => {
                 let mut buf = [0u8; 512];
                 let n = unsafe { config_list(buf.as_mut_ptr() as *mut c_char, buf.len()) };
@@ -336,6 +362,25 @@ impl IControl for ZephyrControl {
                     None => ret = Ret::MalformedValue,
                 }
             }
+            // "#hub75,<geometry>,<protocol>,<color>,<off_color>,<brightness>"
+            // - the HUB75 LED matrix, e.g. the default
+            // "64:32:rt:1x1,8:n:500:shift,#ff0000,#000000,512"; empty fields keep
+            // the default's, a bare "#hub75" disables it (and releases its
+            // pins). See hub75_task.h's hub75_config_set() for the format -
+            // it validates and stores it, and hub75_task.c restarts the
+            // panel with it right away. nRF-only, modelled on
+            // nodem-esp32's "#iled".
+            "hub75" => {
+                let mut value_buf = [0u8; VAL_BUF_LEN];
+                match to_cstr(args.trim(), &mut value_buf) {
+                    Some(v) => match unsafe { hub75_config_set(v.as_ptr() as *const c_char) } {
+                        0 => {}
+                        EINVAL_NEG => ret = Ret::MalformedValue,
+                        _ => ret = Ret::Error,
+                    },
+                    None => ret = Ret::MalformedValue,
+                }
+            }
             // "#nodem,<width>:<height>:<bits_per_pixel>[,<device>...]" -
             // the nodem framebuffer's size and which part of it each
             // output driver shows, e.g. the default "128:64:1,oled:0:0:1:1";
@@ -357,7 +402,7 @@ impl IControl for ZephyrControl {
             // "key=value" lines of the device's configuration, same shape
             // as nodem-esp32's "#cfg" - only the keys this firmware has.
             "cfg" => {
-                for key in [c"oled", c"nodem"] {
+                for key in [c"oled", c"hub75", c"nodem"] {
                     let mut value_buf = [0u8; VAL_BUF_LEN];
                     unsafe {
                         config_get_str(

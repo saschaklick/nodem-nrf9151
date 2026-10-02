@@ -58,6 +58,11 @@
 #define CMD_SET_PAGE_ADDR       0x22
 #define CMD_INTERNAL_IREF       0xAD
 
+/* Status byte (an I2C read): set while the display is off - which is also
+ * where a panel that lost power and came back up sits, at its reset
+ * defaults. */
+#define SSD1306_STATUS_DISPLAY_OFF BIT(6)
+
 /* The SSD1306's own display RAM - every panel size is a window into it. */
 #define SSD1306_RAM_COLS 128
 #define SSD1306_RAM_ROWS 64
@@ -284,6 +289,10 @@ static int ssd1306_init(const struct device *i2c, const struct oled_size *size,
 	int err = 0;
 
 	err |= write_cmd(i2c, CMD_DISPLAY_OFF);
+	/* First, before anything touches display RAM (ssd1306_clear()) -
+	 * RAM written during an active scroll can be corrupted, and nothing
+	 * guarantees the panel isn't in one after a warm reset. */
+	err |= write_cmd(i2c, CMD_DEACTIVATE_SCROLL);
 
 	err |= write_cmd(i2c, CMD_SET_DISPLAY_CLK_DIV);
 	err |= write_cmd(i2c, 0x80);
@@ -327,7 +336,6 @@ static int ssd1306_init(const struct device *i2c, const struct oled_size *size,
 
 	err |= write_cmd(i2c, CMD_ENTIRE_DISPLAY_ON);
 	err |= write_cmd(i2c, CMD_NORMAL_DISPLAY);
-	err |= write_cmd(i2c, CMD_DEACTIVATE_SCROLL);
 
 	err |= write_cmd(i2c, CMD_DISPLAY_ON);
 
@@ -403,20 +411,39 @@ static int ssd1306_clear(const struct device *i2c)
 	return err;
 }
 
-/* Which framebuffer coordinate driver pixel `d` (of `size` along this axis)
- * reads - nodem-esp32's DriverView::pixel() axis mapping: a framebuffer
- * smaller than the driver's output once scaled is centered on it, then
- * everything is shifted by the mapping's offset. */
-static int16_t map_axis(int d, int size, int fb_size, int scale, int shift)
+static int ssd1306_read_status(const struct device *i2c, uint8_t *status)
 {
-	int margin = MAX((size - fb_size * scale) / 2, 0);
-	int rel = d - margin;
-	/* Floor division, so pixels left of/above the margin land on
-	 * negative (off) framebuffer coordinates rather than rounding onto
-	 * the first one. */
-	int q = rel >= 0 ? rel / scale : -((-rel + scale - 1) / scale);
+	return i2c_read(i2c, status, 1, SSD1306_ADDR);
+}
 
-	return (int16_t)CLAMP(shift + q, INT16_MIN, INT16_MAX);
+/* Takes the panel from whatever state it's in to initialized, blank and on.
+ * The SSD1306 only resets on power-up, so after a warm reset of this chip
+ * (flash, debugger reset, watchdog) it can be anywhere: mid-transfer and
+ * holding SDA low (the bus recovery's 9 clocks get it to let go), or with
+ * stale settings (the init sets everything it relies on). `status_check`
+ * says whether the panel's status byte can be trusted for the periodic
+ * health check - only if it reads back as "on" right after this, since
+ * not every SSD1306 clone implements reads. */
+static int panel_setup(const struct device *i2c, const struct oled_size *size,
+		       const struct oled_config *config, bool *status_check)
+{
+	int err = i2c_recover_bus(i2c);
+
+	if (err && err != -ENOSYS) {
+		warn(TAG, "i2c bus recovery failed, err %d", err);
+	}
+
+	err = ssd1306_init(i2c, size, config);
+	if (!err) {
+		err = ssd1306_clear(i2c);
+	}
+
+	uint8_t status;
+
+	*status_check = !err && ssd1306_read_status(i2c, &status) == 0 &&
+			!(status & SSD1306_STATUS_DISPLAY_OFF);
+
+	return err;
 }
 
 /* nodem_task.c's own framebuffer (no copy of it here) and the config it's
@@ -518,14 +545,14 @@ static void frame_prepare(const struct oled_config *oc)
 	for (int c = 0; c < oc->width; c++) {
 		fm.col_bit[c] =
 			fm.transposed
-				? axis_bit(map_axis(c, fm.view_h, h, m->scale_y, m->y), h, w)
-				: axis_bit(map_axis(c, fm.view_w, w, m->scale_x, m->x), w, 1);
+				? axis_bit(nodem_map_axis(c, fm.view_h, h, m->scale_y, m->y), h, w)
+				: axis_bit(nodem_map_axis(c, fm.view_w, w, m->scale_x, m->x), w, 1);
 	}
 	for (int r = 0; r < oc->height; r++) {
 		fm.row_bit[r] =
 			fm.transposed
-				? axis_bit(map_axis(r, fm.view_w, w, m->scale_x, m->x), w, 1)
-				: axis_bit(map_axis(r, fm.view_h, h, m->scale_y, m->y), h, w);
+				? axis_bit(nodem_map_axis(r, fm.view_w, w, m->scale_x, m->x), w, 1)
+				: axis_bit(nodem_map_axis(r, fm.view_h, h, m->scale_y, m->y), h, w);
 	}
 }
 
@@ -611,6 +638,10 @@ static void build_page(uint8_t skip, uint8_t cols, int pg)
 #define DISPLAY_STACK_SIZE 1024
 #define DISPLAY_PRIORITY   5
 #define DISPLAY_POLL_MS    20
+/* How often a panel that failed to set up is retried. */
+#define DISPLAY_RETRY_MS   1000
+/* How often a working panel's status byte is checked (see panel_setup()). */
+#define DISPLAY_CHECK_MS   1000
 
 static void display_task(void *p1, void *p2, void *p3)
 {
@@ -618,7 +649,7 @@ static void display_task(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	const struct device *i2c = DEVICE_DT_GET(DT_NODELABEL(i2c3));
+	const struct device *i2c = DEVICE_DT_GET(DT_NODELABEL(i2c2));
 
 	if (!device_is_ready(i2c)) {
 		error(TAG, "i2c device not ready");
@@ -629,7 +660,17 @@ static void display_task(void *p1, void *p2, void *p3)
 	/* Anything but the current generation, so the first pass sets up. */
 	atomic_val_t generation = atomic_get(&oled_generation) - 1;
 	struct oled_config config;
+	const struct oled_size *size = NULL;
+	/* Configured on (`enabled`) is separate from actually working
+	 * (`initialized`) - an enabled panel that isn't working is set up
+	 * again every DISPLAY_RETRY_MS until it is, whether its first setup
+	 * failed or it was lost later (a failed write, or the health check). */
+	bool enabled = false;
 	bool initialized = false;
+	bool status_check = false;
+	bool setup_failing = false;
+	int64_t next_setup = 0;
+	int64_t next_check = 0;
 	/* The write window in display RAM, and how many of the frame's own
 	 * leading columns fall before it (cut off at the RAM's edge). */
 	uint8_t col = 0, cols = 0, skip = 0, pages = 0;
@@ -647,14 +688,9 @@ static void display_task(void *p1, void *p2, void *p3)
 			initialized = false;
 			sent_valid = false;
 
-			if (oled_config_read(&config)) {
-				const struct oled_size *size =
-					oled_size_find(config.width, config.height);
-				int err = ssd1306_init(i2c, size, &config);
-
-				info(TAG, "ssd1306_init %ux%u+%u+%u rot %u err=%d", config.width,
-				     config.height, config.x, config.y, config.rotation, err);
-				initialized = err == 0;
+			enabled = oled_config_read(&config);
+			if (enabled) {
+				size = oled_size_find(config.width, config.height);
 
 				/* The draw area's start column in display RAM:
 				 * the size's own column offset plus the
@@ -676,16 +712,54 @@ static void display_task(void *p1, void *p2, void *p3)
 				cols = MAX(MIN(config.width, SSD1306_RAM_COLS - start) - skip, 0);
 				pages = config.height / 8;
 
-				if (initialized && ssd1306_clear(i2c)) {
-					warn(TAG, "ssd1306 clear failed");
-				}
-
-				/* First frame goes out right away - the panel
-				 * has just been (re)initialized and shows
-				 * nothing yet. */
-				atomic_set(&display_dirty, 1);
+				setup_failing = false;
+				next_setup = 0;
 			} else {
 				info(TAG, "oled disabled");
+			}
+		}
+
+		int64_t now = k_uptime_get();
+
+		if (enabled && !initialized && now >= next_setup) {
+			int err = panel_setup(i2c, size, &config, &status_check);
+
+			initialized = err == 0;
+			next_setup = now + DISPLAY_RETRY_MS;
+			next_check = now + DISPLAY_CHECK_MS;
+
+			/* Logged on success and on the first failure of a
+			 * streak - not on every retry of a panel that's
+			 * simply not connected. */
+			if (initialized || !setup_failing) {
+				info(TAG, "ssd1306_init %ux%u+%u+%u rot %u err=%d%s", config.width,
+				     config.height, config.x, config.y, config.rotation, err,
+				     initialized ? "" : ", retrying every 1s");
+			}
+			if (initialized && !status_check) {
+				info(TAG, "ssd1306 status not readable, health check off");
+			}
+			setup_failing = !initialized;
+
+			/* First frame goes out right away - the panel has
+			 * just been (re)initialized and shows nothing yet. */
+			if (initialized) {
+				atomic_set(&display_dirty, 1);
+			}
+		}
+
+		if (initialized && status_check && now >= next_check) {
+			uint8_t status = 0;
+			int err = ssd1306_read_status(i2c, &status);
+
+			next_check = now + DISPLAY_CHECK_MS;
+			if (err || (status & SSD1306_STATUS_DISPLAY_OFF)) {
+				warn(TAG, "ssd1306 lost (err=%d status=0x%02x), setting up again", err,
+				     status);
+				initialized = false;
+				sent_valid = false;
+				next_setup = now;
+				continue;
 			}
 		}
 
@@ -741,15 +815,17 @@ static void display_task(void *p1, void *p2, void *p3)
 				sent_valid = true;
 			}
 
-			/* Same as nodem-esp32's run_ssd1306(): a failed
-			 * initial init leaves the panel alone until the
-			 * config changes; a failed flush reinitializes, and
-			 * the next frame tries again. */
+			/* A failed flush sets the panel up again right away
+			 * (bus recovery included), and from then on every
+			 * DISPLAY_RETRY_MS until it works - unlike
+			 * nodem-esp32's run_ssd1306(), which gives up on a
+			 * panel whose init failed until the config changes. */
 			if (err) {
+				error(TAG, "ssd1306 write failed, err %d, setting up again", err);
+				initialized = false;
 				sent_valid = false;
-				err = ssd1306_init(
-					i2c, oled_size_find(config.width, config.height), &config);
-				error(TAG, "ssd1306 write failed, reinitialized err=%d", err);
+				next_setup = now;
+				continue;
 			}
 		}
 		k_msleep(DISPLAY_POLL_MS);

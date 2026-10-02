@@ -8,6 +8,7 @@ target_sources(app PRIVATE
     src/config_store.c
     src/display_task.c
     src/heartbeat_task.c
+    src/hub75_task.c
     src/log.c
     src/modem_task.c
     src/nodem_config.c

@@ -1379,13 +1379,20 @@ static void modem_status_modem_line(char *buf, size_t buf_len)
 	}
 }
 
+/* config_store's "status" (an i32, set by "#status" - see control.rs):
+ * 0 hides the overlay below altogether, anything else (and the default,
+ * when it's never been set) shows it. Read every pass - only a RAM lookup -
+ * so a change takes effect within one MODEM_STATUS_PERIOD_MS. */
+#define MODEM_STATUS_SHOW_KEY     "status"
+#define MODEM_STATUS_SHOW_DEFAULT 1
+
 /* Shown on nodem's display via nodem_status_message_set() as two lines - the
  * modem connection itself (INIT..PDN: modem init, SIM readiness, LTE/PDN
  * attach) on the first, the cloud connection built on top of it (TLS..
  * WEBSOCKET: TLS handshake, cloud registration, the live websocket channel)
  * on the second - cleared entirely only once every step in both groups is
  * STEP_OK, so the overlay only ever appears when there's actually something
- * to report. */
+ * to report - or always, while hidden by MODEM_STATUS_SHOW_KEY. */
 static void modem_status_task(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
@@ -1397,6 +1404,8 @@ static void modem_status_task(void *p1, void *p2, void *p3)
 
 		if (runtime) {
 			bool all_ok = true;
+			bool show = config_get_i32(MODEM_STATUS_SHOW_KEY,
+						   MODEM_STATUS_SHOW_DEFAULT) != 0;
 
 			for (enum modem_step step = MODEM_STEP_INIT; step < MODEM_STEP_COUNT;
 			     step++) {
@@ -1406,7 +1415,7 @@ static void modem_status_task(void *p1, void *p2, void *p3)
 				}
 			}
 
-			if (all_ok) {
+			if (all_ok || !show) {
 				nodem_status_message_clear(runtime);
 			} else {
 				char line1[32];

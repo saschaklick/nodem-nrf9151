@@ -9,6 +9,7 @@
 
 #include "config_store.h"
 #include "display_task.h"
+#include "hub75_task.h"
 #include "modem_task.h"
 #include "nodem_config.h"
 #include "nodem_ffi.h"
@@ -316,9 +317,11 @@ static void nodem_task(void *p1, void *p2, void *p3)
 			}
 		}
 
-		/* display_task maps this onto the configured panel itself
-		 * (see display_oled_set()), reading it in place. */
+		/* display_task and hub75_task each map this onto their own
+		 * panel themselves (through the config's "oled"/"hub75"
+		 * entries), reading it in place. */
 		display_task_submit(nodem_fb, &nodem);
+		hub75_task_submit(nodem_fb, &nodem);
 	}
 }
 

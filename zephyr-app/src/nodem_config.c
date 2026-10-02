@@ -78,13 +78,26 @@ static bool next_num(const char **s, long min, long max, long *out)
 }
 
 /* "<driver>:<x>:<y>:<scale_x>:<scale_y>" - nodem-esp32's
- * DeviceMapping::parse(), with "oled" as the only driver. */
-static bool parse_device(const char *s, struct nodem_mapping *out)
+ * DeviceMapping::parse(), with "oled" and "hub75" as the drivers. `out`
+ * gets the mapping of whichever one it names, false if it's already been
+ * mapped. */
+static bool parse_device(const char *s, struct nodem_config *c)
 {
 	char driver[8];
 	long x, y, scale_x, scale_y;
+	struct nodem_mapping *out;
 
-	if (!next_field(&s, ':', driver, sizeof(driver)) || strcmp(driver, "oled") != 0) {
+	if (!next_field(&s, ':', driver, sizeof(driver))) {
+		return false;
+	}
+	if (strcmp(driver, "oled") == 0) {
+		out = &c->oled;
+	} else if (strcmp(driver, "hub75") == 0) {
+		out = &c->hub75;
+	} else {
+		return false;
+	}
+	if (out->present) {
 		return false;
 	}
 	if (!next_num(&s, INT16_MIN, INT16_MAX, &x) || !next_num(&s, INT16_MIN, INT16_MAX, &y) ||
@@ -133,33 +146,38 @@ static bool parse(const char *s, struct nodem_config *out)
 	}
 
 	while (s != NULL) {
-		struct nodem_mapping device;
-
 		if (!next_field(&s, ',', entry, sizeof(entry))) {
 			return false;
 		}
 		if (entry[0] == '\0') {
 			continue;
 		}
-		if (!parse_device(entry, &device) || c.oled.present) {
+		if (!parse_device(entry, &c)) {
 			return false;
 		}
-		c.oled = device;
 	}
 
 	*out = c;
 	return true;
 }
 
-/* nodem-esp32's NodemConfig::to_nvs_string(). */
+static void format_device(char *buf, size_t buf_len, int *n, const char *driver,
+			  const struct nodem_mapping *m)
+{
+	if (m->present && *n > 0 && (size_t)*n < buf_len) {
+		*n += snprintf(buf + *n, buf_len - *n, ",%s:%d:%d:%u:%u", driver, m->x, m->y,
+			       m->scale_x, m->scale_y);
+	}
+}
+
+/* nodem-esp32's NodemConfig::to_nvs_string() - drivers in a fixed order,
+ * whatever order they were given in. */
 static void format(const struct nodem_config *c, char *buf, size_t buf_len)
 {
 	int n = snprintf(buf, buf_len, "%u:%u:%u", c->width, c->height, c->bits_per_pixel);
 
-	if (c->oled.present && n > 0 && (size_t)n < buf_len) {
-		snprintf(buf + n, buf_len - n, ",oled:%d:%d:%u:%u", c->oled.x, c->oled.y,
-			 c->oled.scale_x, c->oled.scale_y);
-	}
+	format_device(buf, buf_len, &n, "oled", &c->oled);
+	format_device(buf, buf_len, &n, "hub75", &c->hub75);
 }
 
 void nodem_config_get(struct nodem_config *out)
