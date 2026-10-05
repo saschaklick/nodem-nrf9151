@@ -167,8 +167,13 @@ pub extern "C" fn nodem_runtime_new(fb_ptr: *mut u8, fb_len: usize, width: u16, 
     ensure_heap();
     ensure_logger();
     let fb = unsafe { slice::from_raw_parts_mut(fb_ptr, fb_len) };
-    let dom = Box::new(Env::new(fb, width, height));
-    Box::into_raw(dom) as *mut c_void
+    // Allocated first, then filled in place - `Box::new(Env::new(..))`
+    // builds the whole Env on the stack and then copies it over, which
+    // (with the "vm"/"demo" features) took ~5.7KB of nodem_task's 4KB
+    // stack and overflowed it at boot.
+    let mut dom = Box::<Env>::new_uninit();
+    dom.write(Env::new(fb, width, height));
+    Box::into_raw(unsafe { dom.assume_init() }) as *mut c_void
 }
 
 /// Points `handle`'s `Surface` at `fb_ptr`/`fb_len`, a `width` x `height`

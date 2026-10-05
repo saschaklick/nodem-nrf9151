@@ -82,11 +82,21 @@ static const uint32_t pins_b[NRF_PWM_CHANNEL_COUNT] = { PIN_R2, PIN_G2, PIN_B2, 
  * lands mid-period, with the data lines stable for half a period on either
  * side of it) and for OE's one partial step (lit for that many ticks). */
 
-/* The longest shift chain - columns shifted per row address: width times
- * the rows of each half that share one address - a config may need. Every
- * buffer is sized for it; hub75_config_parse() rejects anything longer.
- * That's e.g. a 64x64 or 128x32 panel at 1/8 scan, or 64x32 at 1/4. */
-#define MAX_CHAIN_LEN 256
+/* Bits per colour channel the driver can do - one bit plane each - and
+ * what a config (or preset) that doesn't say gets: 4 keeps two chained
+ * 64x32 1/8 scan panels at 60Hz; every bit more halves the refresh rate. */
+#define MAX_DEPTH     8
+#define DEPTH_DEFAULT 4
+
+/* Where every buffer whose size depends on the config comes from - the
+ * frame, the PWM step buffers, the chain and column tables, the effects'
+ * colour tables - laid out per config by hub75_alloc(). A config that
+ * doesn't fit is driven on fewer of its panels (see hub75_alloc()). Two
+ * 64x32 1/8 scan panels at 4 bits per channel take ~21KB of it. Only ever
+ * one block at a time, so a plain arena rather than a heap - no allocator
+ * code, no fragmentation. */
+#define HUB75_ARENA_SIZE (22 * 1024)
+static uint8_t hub75_arena[HUB75_ARENA_SIZE] __aligned(8);
 
 /* Two idle steps (CLK low, OE high) after the data: SEQEND fires once the last
  * value has been *read* from RAM, which can be before the previous one has
@@ -94,7 +104,6 @@ static const uint32_t pins_b[NRF_PWM_CHANNEL_COUNT] = { PIN_R2, PIN_G2, PIN_B2, 
  * of the current period - with two trailing idle steps, every data period
  * has fully played by the time the PWM stops. */
 #define IDLE_STEPS    2
-#define MAX_SEQ_STEPS (MAX_CHAIN_LEN + IDLE_STEPS)
 
 /* The column driver chips - what has to happen before a panel shows
  * anything. */
@@ -132,7 +141,7 @@ static const char *chip_name(enum hub75_chip chip)
  * effect_at() for what each looks like. */
 enum hub75_effect {
 	EFFECT_NONE,
-	EFFECT_RAINBOW,
+	EFFECT_PLASMA,
 	EFFECT_STRIPES,
 	EFFECT_WAVE,
 	EFFECT_SCROLL,
@@ -153,7 +162,11 @@ static const struct {
 	 * that doesn't move (and takes no speed). */
 	uint8_t speed;
 } effects[] = {
-	{ "rainbow", EFFECT_RAINBOW, 2 },
+	{ "plasma", EFFECT_PLASMA, 2 },
+	/* What "plasma" used to be called - still read from stored configs,
+	 * stored as "plasma" from then on (the first name is what's
+	 * stored). */
+	{ "rainbow", EFFECT_PLASMA, 2 },
 	{ "stripes", EFFECT_STRIPES, 4 },
 	{ "wave", EFFECT_WAVE, 4 },
 	{ "scroll", EFFECT_SCROLL, 3 },
@@ -165,14 +178,29 @@ static const struct {
 	{ "gradient", EFFECT_GRADIENT, 0 },
 };
 
+#define PALETTE_MAX   8
+#define SCALE_MAX     32
+/* The pattern's size as it was before <scale> existed. */
+#define SCALE_DEFAULT 8
+
 struct hub75_color {
 	enum hub75_effect effect;
 	/* Effects only: per-frame step, 1-EFFECT_SPEED_MAX (0 for a static
 	 * one). */
 	uint8_t speed;
+	/* Effects only: the 3-bit colours to use, in order (palette_len 0:
+	 * the effect's own - see effect_palette()), and the pattern's size,
+	 * 1-SCALE_MAX (SCALE_DEFAULT: as designed, larger: stretched). */
+	uint8_t palette[PALETTE_MAX];
+	uint8_t palette_len;
+	uint8_t scale;
 	/* EFFECT_NONE only: 0xRRGGBB. */
 	uint32_t rgb;
 };
+
+/* Palette letters, the fully saturated colours (and black, white) - in
+ * 3-bit form, bit 0 red, bit 1 green, bit 2 blue. */
+static const char palette_letters[] = "krgybmcw";
 
 struct hub75_config {
 	/* The whole display - a grid of `grid_x` by `grid_y` panels, each
@@ -202,6 +230,8 @@ struct hub75_config {
 	bool zigzag;
 	uint16_t clock_khz;
 	enum hub75_chip chip;
+	/* Bits per colour channel, 1-MAX_DEPTH - bit planes, see hub75_isr(). */
+	uint8_t depth;
 	struct hub75_color color;
 	struct hub75_color off_color;
 	uint16_t brightness;
@@ -353,7 +383,7 @@ static bool parse_chain(const char *s, struct hub75_config *c)
 		char *end;
 		long v = strtol(s, &end, 10);
 
-		if (v > MAX_CHAIN_LEN) {
+		if (v > UINT8_MAX) {
 			return false;
 		}
 		c->segment = v;
@@ -388,6 +418,7 @@ static bool parse_protocol(const char *s, struct hub75_config *c)
 			c->zigzag = false;
 			c->clock_khz = 500;
 			c->chip = CHIP_SHIFT;
+			c->depth = DEPTH_DEFAULT;
 			return true;
 		}
 	}
@@ -395,8 +426,8 @@ static bool parse_protocol(const char *s, struct hub75_config *c)
 	char field[16];
 	long v;
 
-	/* "<scan>:<chain>:<clock_khz>:<chip>", each part optional - c
-	 * already holds the default's. */
+	/* "<scan>:<chain>:<clock_khz>:<chip>:<depth>", each part optional -
+	 * c already holds the default's. */
 	if (!next_field(&s, ':', field, sizeof(field))) {
 		return false;
 	}
@@ -421,7 +452,7 @@ static bool parse_protocol(const char *s, struct hub75_config *c)
 		}
 		c->clock_khz = v;
 	}
-	if (!next_field(&s, ':', field, sizeof(field)) || s != NULL) {
+	if (!next_field(&s, ':', field, sizeof(field))) {
 		return false;
 	}
 	if (field[0] != '\0') {
@@ -437,41 +468,75 @@ static bool parse_protocol(const char *s, struct hub75_config *c)
 			return false;
 		}
 	}
+	if (!next_field(&s, ':', field, sizeof(field)) || s != NULL) {
+		return false;
+	}
+	if (field[0] != '\0') {
+		if (!parse_num(field, 1, MAX_DEPTH, &v)) {
+			return false;
+		}
+		c->depth = v;
+	}
 	return true;
 }
 
-/* "<effect>[:<speed>]" (one of `effects`, speed 1-EFFECT_SPEED_MAX, a
- * static one without), or "#" and up to 6 hex digits, 2 per channel, r then
- * g then b - missing digits are 0, same as nodem-esp32's "#iled" colours
- * ("#f" is 0xf00000). */
+/* "<effect>[:<speed>[:<palette>[:<scale>]]]" - one of `effects`, speed
+ * 1-EFFECT_SPEED_MAX (none for a static one), palette up to PALETTE_MAX of
+ * `palette_letters`, scale 1-SCALE_MAX, an empty part its default - or "#"
+ * and up to 6 hex digits, 2 per channel, r then g then b - missing digits
+ * are 0, same as nodem-esp32's "#iled" colours ("#f" is 0xf00000). */
 static bool parse_color(const char *s, struct hub75_color *out)
 {
 	if (s[0] != '#') {
-		char name[12];
-		const char *speed = strchr(s, ':');
-		size_t len = speed ? (size_t)(speed - s) : strlen(s);
+		char name[12], speed[4], palette[PALETTE_MAX + 1], scale[4];
 
-		if (len >= sizeof(name)) {
+		if (!next_field(&s, ':', name, sizeof(name)) ||
+		    !next_field(&s, ':', speed, sizeof(speed)) ||
+		    !next_field(&s, ':', palette, sizeof(palette)) ||
+		    !next_field(&s, ':', scale, sizeof(scale)) || s != NULL) {
 			return false;
 		}
-		memcpy(name, s, len);
-		name[len] = '\0';
 
-		for (size_t i = 0; i < ARRAY_SIZE(effects); i++) {
-			if (strcmp(name, effects[i].name) != 0) {
-				continue;
+		size_t i;
+
+		for (i = 0; i < ARRAY_SIZE(effects); i++) {
+			if (strcmp(name, effects[i].name) == 0) {
+				break;
 			}
+		}
+		if (i == ARRAY_SIZE(effects)) {
+			return false;
+		}
 
-			long v = effects[i].speed;
+		struct hub75_color c = {
+			.effect = effects[i].effect,
+			.speed = effects[i].speed,
+			.scale = SCALE_DEFAULT,
+		};
+		long v;
 
-			if (speed && (effects[i].speed == 0 ||
-				      !parse_num(speed + 1, 1, EFFECT_SPEED_MAX, &v))) {
+		if (speed[0] != '\0') {
+			if (effects[i].speed == 0 || !parse_num(speed, 1, EFFECT_SPEED_MAX, &v)) {
 				return false;
 			}
-			*out = (struct hub75_color){ .effect = effects[i].effect, .speed = v };
-			return true;
+			c.speed = v;
 		}
-		return false;
+		for (const char *l = palette; *l; l++) {
+			const char *at = strchr(palette_letters, *l);
+
+			if (!at) {
+				return false;
+			}
+			c.palette[c.palette_len++] = at - palette_letters;
+		}
+		if (scale[0] != '\0') {
+			if (!parse_num(scale, 1, SCALE_MAX, &v)) {
+				return false;
+			}
+			c.scale = v;
+		}
+		*out = c;
+		return true;
 	}
 	if (strlen(s) > 7) {
 		return false;
@@ -512,6 +577,7 @@ static void hub75_default(struct hub75_config *c)
 		.scan = 8,
 		.clock_khz = 500,
 		.chip = CHIP_SHIFT,
+		.depth = DEPTH_DEFAULT,
 		.color = { .effect = EFFECT_NONE, .rgb = 0xff0000 },
 		.off_color = { .effect = EFFECT_NONE, .rgb = 0x000000 },
 		.brightness = 512,
@@ -573,8 +639,7 @@ static int hub75_config_parse(const char *value, struct hub75_config *out)
 
 	if ((uint32_t)c.width * c.height > HUB75_MAX_PIXELS || c.width % c.grid_x != 0 ||
 	    c.height % c.grid_y != 0 || panel_h % (2 * c.scan) != 0 ||
-	    (c.segment && panel_w % c.segment != 0) ||
-	    (uint32_t)c.width * c.grid_y * (panel_h / 2 / c.scan) > MAX_CHAIN_LEN) {
+	    (c.segment && panel_w % c.segment != 0)) {
 		return -EINVAL;
 	}
 
@@ -582,8 +647,9 @@ static int hub75_config_parse(const char *value, struct hub75_config *out)
 	return 1;
 }
 
-/* The inverse of parse_color() - an effect's speed only if it isn't its
- * default. */
+/* The inverse of parse_color() - an effect's parts only as far as one
+ * isn't its default (an earlier part empty if it is, but a later one
+ * isn't: "plasma::cg"). */
 static void format_color(const struct hub75_color *c, char *buf, size_t buf_len)
 {
 	if (c->effect == EFFECT_NONE) {
@@ -594,10 +660,28 @@ static void format_color(const struct hub75_color *c, char *buf, size_t buf_len)
 		if (effects[i].effect != c->effect) {
 			continue;
 		}
-		if (c->speed == effects[i].speed) {
-			snprintf(buf, buf_len, "%s", effects[i].name);
+
+		char speed[4] = "", palette[PALETTE_MAX + 1] = "", scale[4] = "";
+
+		if (c->speed != effects[i].speed) {
+			snprintf(speed, sizeof(speed), "%u", c->speed);
+		}
+		for (size_t j = 0; j < c->palette_len; j++) {
+			palette[j] = palette_letters[c->palette[j]];
+		}
+		palette[c->palette_len] = '\0';
+		if (c->scale != SCALE_DEFAULT) {
+			snprintf(scale, sizeof(scale), "%u", c->scale);
+		}
+
+		if (scale[0]) {
+			snprintf(buf, buf_len, "%s:%s:%s:%s", effects[i].name, speed, palette, scale);
+		} else if (palette[0]) {
+			snprintf(buf, buf_len, "%s:%s:%s", effects[i].name, speed, palette);
+		} else if (speed[0]) {
+			snprintf(buf, buf_len, "%s:%s", effects[i].name, speed);
 		} else {
-			snprintf(buf, buf_len, "%s:%u", effects[i].name, c->speed);
+			snprintf(buf, buf_len, "%s", effects[i].name);
 		}
 		return;
 	}
@@ -616,14 +700,14 @@ static void hub75_config_format(const struct hub75_config *c, char *buf, size_t 
 		snprintf(chain, sizeof(chain), "%c%s", c->far_first ? 'f' : 'n',
 			 c->zigzag ? "z" : "");
 	}
-	char color[16], off_color[16];
+	char color[32], off_color[32];
 
 	format_color(&c->color, color, sizeof(color));
 	format_color(&c->off_color, off_color, sizeof(off_color));
-	snprintf(buf, buf_len, "%u:%u:%c%c:%ux%u%s,%u:%s:%u:%s,%s,%s,%u", c->width, c->height,
-		 c->flip_x ? 'r' : 'l', c->flip_y ? 'b' : 't', c->grid_x, c->grid_y,
-		 c->serpentine ? "i" : "", c->scan, chain, c->clock_khz, chip_name(c->chip), color,
-		 off_color, c->brightness);
+	snprintf(buf, buf_len, "%u:%u:%c%c:%ux%u%s,%u:%s:%u:%s:%u,%s,%s,%u", c->width,
+		 c->height, c->flip_x ? 'r' : 'l', c->flip_y ? 'b' : 't', c->grid_x, c->grid_y,
+		 c->serpentine ? "i" : "", c->scan, chain, c->clock_khz, chip_name(c->chip),
+		 c->depth, color, off_color, c->brightness);
 }
 
 int hub75_config_set(const char *value)
@@ -692,9 +776,15 @@ static struct hub75_config active;
 static uint8_t scan_rows;
 static uint8_t row_blocks;
 static uint16_t chain_len;
-/* One panel's size. */
+/* One panel's size, and how many there are and are driven - the first
+ * drive_panels along the chain, all of them unless hub75_alloc() couldn't
+ * get the memory - and so the columns per shift that are actually data
+ * (the rest is shifted out as blank filler, see pwm_setup()). */
 static uint16_t panel_w;
 static uint16_t panel_h;
+static uint8_t total_panels;
+static uint8_t drive_panels;
+static uint16_t drive_len;
 static uint32_t addr_all_mask;
 
 /* EasyDMA source for each instance - one 16-bit value per channel per step
@@ -702,9 +792,15 @@ static uint32_t addr_all_mask;
  * 0|1 and 2|3, little-endian - so render_row() writes a whole step in two
  * stores. Two of each, ping-ponged: while one pair is being shifted out,
  * the ISR renders the next row into the other. seq_b's channel 3 is OE:
- * while one row is being shifted in, it gates the previously latched one. */
-static uint32_t seq_a[2][MAX_SEQ_STEPS][2];
-static uint32_t seq_b[2][MAX_SEQ_STEPS][2];
+ * while one row is being shifted in, it gates the previously latched one.
+ * drive_len + IDLE_STEPS steps each, from hub75_arena. */
+typedef uint32_t step_t[2];
+static step_t *seq_a[2];
+static step_t *seq_b[2];
+/* The blank filler for the panels that aren't driven - one step, repeated
+ * (PWM "refresh") for every column of theirs. */
+static step_t filler_a;
+static step_t filler_b;
 
 #define STEP_WORD(lo, hi) ((uint32_t)(lo) | ((uint32_t)(hi) << 16))
 
@@ -715,44 +811,97 @@ static uint32_t seq_b[2][MAX_SEQ_STEPS][2];
 #define PX_COMBOS 64
 static uint32_t lut_px[PX_COMBOS][4];
 
-/* OE from the brightness: lit (low) for the first `oe_full_steps` data
- * steps of each row, then `oe_partial` (already in the high half: lit for
- * part of that step, or blanked) for the next one, blanked after. */
-static uint16_t oe_full_steps;
-static uint32_t oe_partial;
+/* OE from the brightness, per bit plane: lit (low) for the first
+ * `oe_full_steps` data steps of the shift that follows the plane's, then
+ * `oe_partial` (already in the high half: lit for part of that step, or
+ * blanked) for the next one, blanked after. Plane k gets 2^k units of
+ * light - the most significant one the whole configured brightness. */
+static uint16_t oe_full_steps[MAX_DEPTH];
+static uint32_t oe_partial[MAX_DEPTH];
+/* Bit planes of the running config. */
+static uint8_t depth;
 /* PWM ticks per column, for the running config. */
 static uint16_t pwm_top;
 
 /* OE for `brightness` (0-HUB75_BRIGHTNESS_MAX) - takes effect from the next
- * row rendered, so it can change while the panel runs (see fade_update()).
+ * row rendered, so it can change while the panel runs.
  * Both halves at once, under irq_lock(), so render_row() never sees one
  * without the other. */
 static void oe_set(uint16_t brightness)
 {
-	uint32_t row_ticks = (uint32_t)chain_len * pwm_top;
+	uint32_t row_ticks = (uint32_t)drive_len * pwm_top;
 	uint32_t on_ticks = (row_ticks * brightness + HUB75_BRIGHTNESS_MAX / 2) /
 			    HUB75_BRIGHTNESS_MAX;
-	uint16_t partial = on_ticks % pwm_top;
+	uint16_t full[MAX_DEPTH];
+	uint32_t partial[MAX_DEPTH];
+
+	for (int k = 0; k < depth; k++) {
+		uint32_t ticks = (on_ticks << k) >> (depth - 1);
+		uint16_t rest = ticks % pwm_top;
+
+		full[k] = ticks / pwm_top;
+		partial[k] = STEP_WORD(0, rest ? rest : PWM_HIGH);
+	}
+
 	unsigned int key = irq_lock();
 
-	oe_full_steps = on_ticks / pwm_top;
-	oe_partial = STEP_WORD(0, partial ? partial : PWM_HIGH);
+	memcpy(oe_full_steps, full, sizeof(full));
+	memcpy(oe_partial, partial, sizeof(partial));
 	irq_unlock(key);
 }
 
 /* What's on the panel, per row address, in shift order (index 0 shifted
- * first): the top half's colour (R1G1B1) in bits 0-2, the bottom half's
- * (R2G2B2) in bits 3-5 - just what one row address's shift
- * needs, in one place. scan_rows rows of chain_len each; written through
- * frame_locate_row()/frame_row_set(). */
-static uint8_t frame[HUB75_MAX_PIXELS / 2];
+ * first): `depth` bytes per chain position, byte k bit plane k - bit k of
+ * the top half's (R1G1B1) colour channel levels in its bits 0-2, the
+ * bottom half's (R2G2B2) in bits 3-5 - just what one shift needs, in one
+ * place. scan_rows rows of drive_len positions each, from hub75_arena;
+ * written through frame_locate_row()/frame_row_set(). */
+static uint8_t *frame;
 
-/* Address of the row currently being shifted in - latched and lit by the
- * next end-of-row interrupt - and which seq_a/seq_b pair it's in. */
-static uint8_t shift_row;
+/* The shift currently in progress - latched and lit by the next interrupt
+ * - as an index into the cycle every row address goes through, plane by
+ * plane (row = shift / depth, plane = shift % depth), and which
+ * seq_a/seq_b pair it's in. */
+static uint16_t shift_seq;
 static uint8_t shift_buf;
 
 static bool running;
+
+/* What hub75_stat_format() reports - set by hub75_task() (and
+ * hub75_start()), read from the command handler's thread; plain stores of
+ * small values, so a reader at worst sees the old state or the new one. */
+enum hub75_stat {
+	STAT_DISABLED,
+	STAT_OK,
+	STAT_LOW_MEM,
+	STAT_NO_MEM,
+	STAT_OVERLOAD,
+};
+static volatile uint8_t stat_state;
+static volatile uint16_t stat_width;
+static volatile uint16_t stat_height;
+static volatile uint8_t stat_driven;
+static volatile uint8_t stat_panels;
+
+size_t hub75_stat_format(char *buf, size_t buf_len)
+{
+	static const char *const states[] = {
+		[STAT_OK] = "ok",
+		[STAT_NO_MEM] = "no_mem",
+		[STAT_OVERLOAD] = "overload",
+	};
+	uint8_t state = stat_state;
+
+	if (state == STAT_DISABLED) {
+		return snprintf(buf, buf_len, "hub75,0,,");
+	}
+	if (state == STAT_LOW_MEM) {
+		return snprintf(buf, buf_len, "hub75,1,%ux%u,low_mem %u/%u panels", stat_width,
+				stat_height, stat_driven, stat_panels);
+	}
+	return snprintf(buf, buf_len, "hub75,1,%ux%u,%s", stat_width, stat_height,
+			states[state]);
+}
 
 /* Set by hub75_isr() when it can't keep the panel going - see
  * hub75_overload_trip() - for hub75_task() to stop it and say why. */
@@ -810,12 +959,43 @@ static uint32_t addr_mask(uint8_t row)
 	return mask;
 }
 
-/* 0xRRGGBB to the 3-bit colour the panel can show for now: each channel
- * on wherever it isn't 0. */
-static uint8_t color_bits(uint32_t rgb)
+/* Colours on their way to the panel: 8 bits per channel, red in bits 0-7,
+ * green 8-15, blue 16-23 - already gamma-corrected (see gamma8), so linear
+ * in light; spread() takes them down to the panel's depth. */
+#define RGB24(r, g, b) ((uint32_t)(r) | ((uint32_t)(g) << 8) | ((uint32_t)(b) << 16))
+
+/* Gamma 2 - (v / 255)^2, close enough to the usual 2.2 - so "#808080" (or
+ * halfway through a blend) looks like about half brightness, not barely
+ * dimmer than full. Computed, not a table: flash is tight. */
+static inline uint8_t gamma8(uint8_t v)
 {
-	return ((rgb & 0xff0000) ? BIT(0) : 0) | ((rgb & 0x00ff00) ? BIT(1) : 0) |
-	       ((rgb & 0x0000ff) ? BIT(2) : 0);
+	return (v * v + 254) / 255;
+}
+
+static uint32_t color_rgb24(uint32_t rgb)
+{
+	return RGB24(gamma8(rgb >> 16), gamma8(rgb >> 8), gamma8(rgb));
+}
+
+/* RGB24() `rgb` the way `frame` holds it: each channel rounded to the
+ * running depth's 2^depth levels, bit k of every channel's level into
+ * byte k (bit plane k) - red bit 0, green 1, blue 2. */
+static uint64_t spread(uint32_t rgb)
+{
+	const uint32_t top = (1u << depth) - 1;
+	uint32_t level[3];
+	uint64_t planes = 0;
+
+	for (int ch = 0; ch < 3; ch++) {
+		level[ch] = (((rgb >> (8 * ch)) & 0xff) * top + 127) / 255;
+	}
+	for (int k = 0; k < depth; k++) {
+		uint64_t bits = ((level[0] >> k) & 1) | (((level[1] >> k) & 1) << 1) |
+				(((level[2] >> k) & 1) << 2);
+
+		planes |= bits << (8 * k);
+	}
+	return planes;
 }
 
 /* --- colour effects, redrawn every FX_FRAME_MS while one is in use --- */
@@ -847,14 +1027,28 @@ static int sin8(uint8_t a)
 	}
 }
 
-/* The fully saturated colours a 1-bit-per-channel panel can show, around
- * the colour wheel: red, yellow, green, cyan, blue, magenta - a hue byte
- * (0-255, once round) picks one. */
-static const uint8_t wheel[6] = { 0x1, 0x3, 0x2, 0x6, 0x4, 0x5 };
+/* The effects' own palettes: the fully saturated colours around the
+ * colour wheel (red, yellow, green, cyan, blue, magenta) for most, black to
+ * white by heat for fire, the wheel and white for sparkle. */
+static const uint8_t wheel[] = { 0x1, 0x3, 0x2, 0x6, 0x4, 0x5 };
+static const uint8_t fire_heat[] = { 0x0, 0x1, 0x3, 0x7 };
+static const uint8_t sparkle_pool[] = { 0x1, 0x3, 0x2, 0x6, 0x4, 0x5, 0x7 };
 
-static inline uint8_t hue_color(uint8_t hue)
+static void effect_palette(const struct hub75_color *c, const uint8_t **pal, uint8_t *n)
 {
-	return wheel[(hue * 6) >> 8];
+	if (c->palette_len) {
+		*pal = c->palette;
+		*n = c->palette_len;
+	} else if (c->effect == EFFECT_FIRE) {
+		*pal = fire_heat;
+		*n = ARRAY_SIZE(fire_heat);
+	} else if (c->effect == EFFECT_SPARKLE) {
+		*pal = sparkle_pool;
+		*n = ARRAY_SIZE(sparkle_pool);
+	} else {
+		*pal = wheel;
+		*n = ARRAY_SIZE(wheel);
+	}
 }
 
 /* A cheap integer hash (lowbias32) - fire and sparkle's randomness,
@@ -879,21 +1073,143 @@ static uint32_t fx_frame;
  * drawn (paint_of()) and the row being drawn (paint_row()). */
 struct paint {
 	enum hub75_effect effect;
-	/* EFFECT_NONE: the 3-bit colour. */
-	uint8_t bits;
+	/* EFFECT_NONE, "cycle" and "fade": the colour every pixel gets this
+	 * frame, spread(). */
+	uint64_t uniform;
+	/* Every other effect: its colours for this frame, spread() - 256
+	 * along the palette (looked up by hue or heat), or for "sparkle"
+	 * each palette colour at SPARKLE_STEPS levels. Built by paint_of(),
+	 * so a pixel costs one lookup, not a blend. */
+	const uint64_t *lut;
 	/* How far the effect has moved: fx_frame * speed. */
 	uint32_t t;
-	/* Per-row term, set by paint_row(). */
+	/* The colours it picks from - see pick() - and its size: pattern
+	 * coordinates are pixel coordinates times zoom / 256. */
+	const uint8_t *pal;
+	uint8_t n;
+	uint16_t zoom;
+	/* Per-row terms, set by paint_row(): the row in pattern
+	 * coordinates, and whatever else the effect needs once per row. */
+	int sy;
 	int row;
 };
 
-static struct paint paint_of(const struct hub75_color *c)
+/* Palette colours `c0` -> `c1` (3-bit, each channel off or full), `f` of
+ * 256 of the way, at `level` of 128 brightness - blended per channel in
+ * 8 bits, then through gamma to the panel's 4, so the steps in between
+ * look even. */
+static inline uint32_t blend(uint8_t c0, uint8_t c1, uint8_t f, uint8_t level)
 {
-	return (struct paint){
+	uint8_t out[3];
+
+	for (int ch = 0; ch < 3; ch++) {
+		int a = (c0 >> ch) & 1 ? 255 : 0;
+		int b = (c1 >> ch) & 1 ? 255 : 0;
+		int v = (a * (256 - f) + b * f) >> 8;
+
+		out[ch] = gamma8((v * level) >> 7);
+	}
+	return RGB24(out[0], out[1], out[2]);
+}
+
+/* A 0-255 value going once round - a hue - to the palette as a closed
+ * loop of colour stops: the last one blends back into the first. */
+static inline uint32_t pick(const struct paint *p, uint8_t v)
+{
+	unsigned int pos = v * p->n;
+	unsigned int i = pos >> 8;
+
+	return blend(p->pal[i], p->pal[(i + 1) % p->n], pos & 0xff, 128);
+}
+
+/* A 0-255 value from one end to the other - a heat - to the palette as an
+ * open ramp of colour stops, first to last. */
+static inline uint32_t pick_ramp(const struct paint *p, uint8_t v)
+{
+	if (p->n == 1) {
+		return blend(p->pal[0], p->pal[0], 0, 128);
+	}
+
+	unsigned int pos = v * (p->n - 1);
+	unsigned int i = pos >> 8;
+
+	return blend(p->pal[i], p->pal[MIN(i + 1, p->n - 1u)], pos & 0xff, 128);
+}
+
+#define SPARKLE_STEPS 32
+
+/* "sparkle"'s twinkle: brightness, of 128, `step` of SPARKLE_STEPS into
+ * one - half a sine wave. */
+static inline uint8_t sparkle_level(int step)
+{
+	return (sin8(step * (128 / SPARKLE_STEPS)) * 128) / 127;
+}
+
+/* One table per colour field - see struct paint's `lut` - 256 entries
+ * each, from hub75_arena. */
+#define PAINT_LUT_LEN 256
+static uint64_t *paint_luts[2];
+
+/* `c` for the frame about to be drawn, `slot` 0 for the lit pixels' colour,
+ * 1 for the unlit ones' (each has its own table). */
+static struct paint paint_of(const struct hub75_color *c, int slot)
+{
+	uint64_t *lut = paint_luts[slot];
+	struct paint p = {
 		.effect = c->effect,
-		.bits = c->effect == EFFECT_NONE ? color_bits(c->rgb) : 0,
 		.t = fx_frame * c->speed,
+		.zoom = c->scale ? (SCALE_DEFAULT << 8) / c->scale : 256,
+		.lut = lut,
 	};
+
+	effect_palette(c, &p.pal, &p.n);
+
+	uint8_t ph = p.t;
+
+	switch (c->effect) {
+	case EFFECT_NONE:
+		p.uniform = spread(color_rgb24(c->rgb));
+		break;
+	case EFFECT_CYCLE:
+		/* Blending all the way round the palette. */
+		p.uniform = spread(pick(&p, ph));
+		break;
+	case EFFECT_FADE: {
+		/* Each palette colour in turn, fading in from black and out
+		 * again - half a sine wave of brightness per colour, 0 right
+		 * where the next one takes over. */
+		unsigned int pos = ph * p.n;
+		uint8_t i = pos >> 8;
+		int env = sin8((pos & 0xff) >> 1);
+
+		p.uniform = spread(blend(p.pal[i], p.pal[i], 0, (env * 128) / 127));
+		break;
+	}
+	case EFFECT_SPARKLE:
+		for (int i = 0; i < p.n; i++) {
+			for (int step = 0; step < SPARKLE_STEPS; step++) {
+				lut[i * SPARKLE_STEPS + step] =
+					spread(blend(p.pal[i], p.pal[i], 0, sparkle_level(step)));
+			}
+		}
+		break;
+	case EFFECT_FIRE:
+		for (int v = 0; v < 256; v++) {
+			lut[v] = spread(pick_ramp(&p, v));
+		}
+		break;
+	default:
+		for (int v = 0; v < 256; v++) {
+			lut[v] = spread(pick(&p, v));
+		}
+		break;
+	}
+	return p;
+}
+
+static inline int zoomed(const struct paint *p, int v)
+{
+	return (v * p->zoom) >> 8;
 }
 
 static bool color_moves(const struct hub75_color *c)
@@ -906,46 +1222,22 @@ static bool effect_in_use(void)
 	return color_moves(&active.color) || color_moves(&active.off_color);
 }
 
-/* "fade": with one bit per channel there's no colour in between two of
- * the wheel's, so it fades through black instead - the whole panel's
- * brightness (OE) follows half a sine wave over every colour step, down to
- * 0 right where the colour changes. Called every effect frame, after
- * fx_frame moved on; the colour (the lit pixels', or else the unlit ones')
- * whose speed it follows is the first that's "fade". */
-static void fade_update(void)
-{
-	const struct hub75_color *c = active.color.effect == EFFECT_FADE ? &active.color
-				      : active.off_color.effect == EFFECT_FADE ? &active.off_color
-										: NULL;
-
-	if (!c) {
-		return;
-	}
-
-	uint8_t ph = fx_frame * c->speed;
-	/* Where in its colour step the wheel is, 0-255 - a step is 1/6 of
-	 * the 256-step wheel (hue_color()). */
-	uint8_t pos = (ph * 6) & 0xff;
-	int env = sin8(pos >> 1);
-
-	oe_set((uint32_t)active.brightness * env / 127);
-}
-
 /* The part of an effect that only depends on the row - once per row. */
 static void paint_row(struct paint *p, int y)
 {
 	uint8_t ph = p->t;
 
+	p->sy = zoomed(p, y);
 	switch (p->effect) {
-	case EFFECT_RAINBOW:
-		p->row = sin8(y * 7 - 2 * ph);
+	case EFFECT_PLASMA:
+		p->row = sin8(p->sy * 7 - 2 * ph);
 		break;
 	case EFFECT_FIRE:
-		/* Rows up from the bottom. */
+		/* Rows up from the bottom - in pixels, it fades by those. */
 		p->row = active.height - 1 - y;
 		break;
 	case EFFECT_RIPPLE:
-		p->row = abs(y - active.height / 2);
+		p->row = zoomed(p, abs(y - active.height / 2));
 		break;
 	default:
 		p->row = 0;
@@ -953,90 +1245,87 @@ static void paint_row(struct paint *p, int y)
 	}
 }
 
-/* Pixel (x, y) of the display in effect `p`'s colour, 3 bits - only fully
- * saturated colours (and white, black), one bit per channel for now, so
- * every effect moves as bands of them. */
-static uint8_t effect_at(const struct paint *p, int x, int y)
+/* Pixel (x, y) of the display in effect `p`'s colour, spread() - every
+ * effect blends between its palette's colours (see pick(), paint_of()),
+ * so they're gradients as fine as the panel's colour depth. */
+static uint64_t effect_at(const struct paint *p, int x, int y)
 {
 	uint8_t ph = p->t;
+	/* In pattern coordinates - <scale> stretches or shrinks it. */
+	int sx = zoomed(p, x);
+	int sy = p->sy;
 
 	switch (p->effect) {
-	case EFFECT_RAINBOW: {
+	case EFFECT_PLASMA: {
 		/* Plasma: a few sine waves over x, y and x + y, each drifting
 		 * with the phase, summed and taken as a hue. */
-		int v = sin8(x * 5 + ph) + p->row + sin8((x + y) * 4 + ph);
+		int v = sin8(sx * 5 + ph) + p->row + sin8((sx + sy) * 4 + ph);
 
-		return hue_color((uint8_t)((v >> 1) + ph));
+		return p->lut[(uint8_t)((v >> 1) + ph)];
 	}
 	case EFFECT_STRIPES:
 		/* Diagonal bands moving along themselves - a barber pole. */
-		return hue_color((uint8_t)((x + y) * 8 - ph));
+		return p->lut[(uint8_t)((sx + sy) * 8 - ph)];
 	case EFFECT_WAVE:
 		/* Horizontal bands, bent up and down by a sine wave running
 		 * along them - a flag. */
-		return hue_color((uint8_t)(y * 8 + (sin8(x * 8 + ph) >> 2)));
+		return p->lut[(uint8_t)(sy * 8 + (sin8(sx * 8 + ph) >> 2))];
 	case EFFECT_SCROLL:
 		/* Vertical bands sliding sideways. */
-		return hue_color((uint8_t)(x * 4 - ph));
+		return p->lut[(uint8_t)(sx * 4 - ph)];
 	case EFFECT_CYCLE:
 	case EFFECT_FADE:
-		/* One colour for every pixel, stepping round the wheel - "fade"
-		 * also dims the whole panel to black around every step, see
-		 * fade_update(). */
-		return hue_color(ph);
+		/* One colour for every pixel - worked out once per frame, see
+		 * paint_of(). */
+		return p->uniform;
 	case EFFECT_GRADIENT:
 		/* A diagonal rainbow, standing still. */
-		return hue_color((uint8_t)((x + y) * 4));
+		return p->lut[(uint8_t)((sx + sy) * 4)];
 	case EFFECT_RIPPLE: {
 		/* Rings moving out from the centre - distance by
 		 * max + min * 3/8 (within a few percent of the real one, no
 		 * square root). */
-		int dx = abs(x - active.width / 2);
+		int dx = zoomed(p, abs(x - active.width / 2));
 		int dy = p->row;
 		int d = MAX(dx, dy) + (MIN(dx, dy) * 3) / 8;
 
-		return hue_color((uint8_t)(d * 12 - ph));
+		return p->lut[(uint8_t)(d * 12 - ph)];
 	}
 	case EFFECT_FIRE: {
-		/* Heat: random cells of 2x2 pixels rising with time, fading
-		 * towards the top, plus a per-pixel flicker - black, red,
-		 * yellow, white as it gets hotter. */
+		/* Heat: random cells of 2x2 (pattern) pixels rising with time,
+		 * fading towards the top, plus a per-pixel flicker - along the
+		 * palette by it, coldest first (black, red, yellow, white by
+		 * default). */
 		int up = p->row;
 		uint32_t rise = p->t / 4;
-		int cell = hash3(x >> 1, (up + rise) >> 1, 0) & 0xff;
+		int cell = hash3(sx >> 1, (zoomed(p, up) + rise) >> 1, 0) & 0xff;
 		int flicker = (int)(hash3(x, up, p->t) & 0x3f) - 32;
 		int heat = cell * (active.height - up) / active.height + flicker +
 			   (up < 2 ? 80 : 0);
 
-		if (heat > 220) {
-			return 0x7;
-		}
-		if (heat > 150) {
-			return 0x3;
-		}
-		if (heat > 80) {
-			return 0x1;
-		}
-		return 0;
+		return p->lut[CLAMP(heat, 0, 255)];
 	}
 	case EFFECT_SPARKLE: {
-		/* Every pixel its own random colour, changing at its own
-		 * random times - now and then white. */
-		uint32_t seed = hash3(x, y, 1);
-		uint32_t epoch = (p->t + (seed & 0xff)) >> 5;
-		uint32_t r = hash3(x, y, epoch + 2);
+		/* Every pixel twinkling on its own: fading in and out again
+		 * (32 steps of the phase), its own random time to start, in a
+		 * new random palette colour every time. */
+		uint32_t seed = hash3(sx, sy, 1);
+		uint32_t local = p->t + (seed & 0xff);
+		uint32_t r = hash3(sx, sy, (local / SPARKLE_STEPS) + 2);
+		unsigned int i = (((r >> 8) & 0xff) * p->n) >> 8;
 
-		return (r & 0x7) == 0 ? 0x7 : hue_color(r >> 8);
+		return p->lut[i * SPARKLE_STEPS + local % SPARKLE_STEPS];
 	}
 	case EFFECT_NONE:
 	default:
-		return p->bits;
+		return p->uniform;
 	}
 }
 
-static inline uint8_t paint_at(const struct paint *p, int x, int y)
+/* Pixel (x, y) in `p`'s colour, spread(). */
+static inline uint64_t paint_at(const struct paint *p, int x, int y)
 {
-	return p->effect == EFFECT_NONE ? p->bits : effect_at(p, x, y);
+	return p->effect == EFFECT_NONE ? p->uniform : effect_at(p, x, y);
 }
 
 /* Per row block (the rows of a panel half sharing one row address, in
@@ -1044,7 +1333,7 @@ static inline uint8_t paint_at(const struct paint *p, int x, int y)
  * its position along that row of panels' part of the address's chain - 0
  * nearest the input connector. Built by chain_build() for the running
  * config, used by frame_locate_row()/frame_row_set(). */
-static uint16_t chain_pos[MAX_CHAIN_LEN];
+static uint16_t *chain_pos;
 
 /* Each panel takes a panel width's worth of every row block, nearest the
  * input first. Within one, the chain goes through the blocks in pieces of
@@ -1093,7 +1382,12 @@ static void chain_build(void)
  * value shifted ends up furthest along, so position 0 (nearest the input)
  * is its last entry. */
 struct frame_row {
-	uint8_t *end;
+	/* The frame entry of chain position 0 (nearest the input), and the
+	 * chain positions before this row of panels' - a pixel's position
+	 * is before + pos[x], its entry `end` minus that, unless it's past
+	 * drive_len (a panel that isn't driven). */
+	int end;
+	int before;
 	const uint16_t *pos;
 	bool reverse;
 	int shift;
@@ -1124,18 +1418,30 @@ static struct frame_row frame_locate_row(int y)
 	int before = grid_row * active.width * row_blocks;
 
 	return (struct frame_row){
-		.end = &frame[addr * chain_len + chain_len - 1 - before],
+		.end = addr * drive_len + drive_len - 1,
+		.before = before,
 		.pos = &chain_pos[block * active.width],
 		.reverse = active.flip_x != upside_down,
 		.shift = (py / half_rows) * 3,
 	};
 }
 
-static inline void frame_row_set(const struct frame_row *r, int x, uint8_t rgb)
+/* Pixel x of the row to `planes` (a colour as spread() makes it) - one
+ * byte per bit plane. */
+static inline void frame_row_set(const struct frame_row *r, int x, uint64_t planes)
 {
-	uint8_t *px = r->end - r->pos[r->reverse ? active.width - 1 - x : x];
+	int pos = r->before + r->pos[r->reverse ? active.width - 1 - x : x];
 
-	*px = (*px & ~(0x07 << r->shift)) | ((rgb & 0x07) << r->shift);
+	if (pos >= drive_len) {
+		return;
+	}
+
+	uint8_t *e = &frame[(r->end - pos) * depth];
+	const uint8_t keep = ~(0x07 << r->shift);
+
+	for (int k = 0; k < depth; k++, planes >>= 8) {
+		e[k] = (e[k] & keep) | ((planes & 0x07) << r->shift);
+	}
 }
 
 /* nodem-esp32's DriverView::fallback_pixel(), as display_task.c's
@@ -1146,8 +1452,8 @@ static void frame_draw_fallback(int phase)
 {
 	const int w = active.width;
 	const int h = active.height;
-	struct paint on = paint_of(&active.color);
-	struct paint off = paint_of(&active.off_color);
+	struct paint on = paint_of(&active.color, 0);
+	struct paint off = paint_of(&active.off_color, 1);
 
 	for (int y = 0; y < h; y++) {
 		struct frame_row r = frame_locate_row(y);
@@ -1181,10 +1487,10 @@ void hub75_task_submit(const uint8_t *buf, const struct nodem_config *config)
 	k_sem_give(&hub75_wake);
 }
 
-/* Per panel column, the framebuffer column it shows (-1: outside it, off)
- * - through the mapping's offset and scale, nodem_map_axis(). Every column
- * is part of the chain, so there are never more than MAX_CHAIN_LEN. */
-static int16_t map_cols[MAX_CHAIN_LEN];
+/* Per display column, the framebuffer column it shows (-1: outside it,
+ * off) - through the mapping's offset and scale, nodem_map_axis(). width
+ * entries, from hub75_arena. */
+static int16_t *map_cols;
 
 /* FNV-1a over the framebuffer and everything it's drawn through - what
  * frame_draw_nodem() last drew, to skip redrawing an unchanged frame
@@ -1223,8 +1529,8 @@ static bool frame_draw_nodem(bool force)
 {
 	const int w = active.width;
 	const int h = active.height;
-	struct paint on = paint_of(&active.color);
-	struct paint off = paint_of(&active.off_color);
+	struct paint on = paint_of(&active.color, 0);
+	struct paint off = paint_of(&active.off_color, 1);
 
 	display_fb_lock();
 	if (!nodem_fb || !nodem.hub75.present) {
@@ -1303,10 +1609,12 @@ static bool frame_draw_nodem(bool force)
  * globals they'd otherwise come from. */
 __attribute__((optimize("O2"))) static void
 render_span(uint32_t (*restrict a)[2], uint32_t (*restrict b)[2], const uint8_t *restrict src,
-	    size_t from, size_t to, uint32_t oe, const uint32_t (*restrict lut)[4])
+	    size_t stride, size_t from, size_t to, uint32_t oe,
+	    const uint32_t (*restrict lut)[4])
 {
 	for (size_t i = from; i < to; i++) {
-		const uint32_t *l = lut[src[i]];
+		/* One plane's byte out of each frame entry. */
+		const uint32_t *l = lut[src[i * stride]];
 
 		a[i][0] = l[0];
 		a[i][1] = l[1];
@@ -1315,28 +1623,39 @@ render_span(uint32_t (*restrict a)[2], uint32_t (*restrict b)[2], const uint8_t 
 	}
 }
 
-/* Row address `row` of `frame` into seq_a/seq_b pair `buf` - runs in the
- * ISR once per row shifted, so it's table lookups only, in three spans by
- * OE: lit, the one partial step, blanked. Only the data steps: the
- * trailing idle ones never change (see hub75_start()). */
-static void render_row(uint8_t buf, uint8_t row)
+/* Shift `seq` of the cycle (see shift_seq) - its row address's data for
+ * its bit plane - into seq_a/seq_b pair `buf`, with the OE that lights the
+ * shift before it (latched while this one shifts) for that one's plane's
+ * share. Runs in the ISR once per shift, so it's table lookups only, in
+ * three spans by OE: lit, the one partial step, blanked. Only the data
+ * steps: the trailing idle ones never change (see hub75_start()). */
+static void render_row(uint8_t buf, uint16_t seq)
 {
-	size_t n = chain_len;
-	size_t lit = MIN(oe_full_steps, n);
-	const uint8_t *src = &frame[row * n];
+	size_t n = drive_len;
+	uint8_t row = seq / depth;
+	uint8_t plane = seq % depth;
+	/* The plane lit while this shift is going out. */
+	uint8_t lit_plane = (plane + depth - 1) % depth;
+	size_t lit = MIN(oe_full_steps[lit_plane], n);
+	const uint8_t *src = &frame[row * n * depth + plane];
 
-	render_span(seq_a[buf], seq_b[buf], src, 0, lit, STEP_WORD(0, PWM_LOW), lut_px);
+	render_span(seq_a[buf], seq_b[buf], src, depth, 0, lit, STEP_WORD(0, PWM_LOW), lut_px);
 	if (lit < n) {
-		render_span(seq_a[buf], seq_b[buf], src, lit, lit + 1, oe_partial, lut_px);
-		render_span(seq_a[buf], seq_b[buf], src, lit + 1, n, STEP_WORD(0, PWM_HIGH),
-			    lut_px);
+		render_span(seq_a[buf], seq_b[buf], src, depth, lit, lit + 1,
+			    oe_partial[lit_plane], lut_px);
+		render_span(seq_a[buf], seq_b[buf], src, depth, lit + 1, n,
+			    STEP_WORD(0, PWM_HIGH), lut_px);
 	}
 }
 
+/* Which PWM sequence holds the data: 1 after the filler (sequence 0) when
+ * not every panel is driven, else 0. */
+static uint8_t data_seq;
+
 static void shift_start(void)
 {
-	nrf_pwm_seq_ptr_set(PWM_A, 0, (const uint16_t *)seq_a[shift_buf]);
-	nrf_pwm_seq_ptr_set(PWM_B, 0, (const uint16_t *)seq_b[shift_buf]);
+	nrf_pwm_seq_ptr_set(PWM_A, data_seq, (const uint16_t *)seq_a[shift_buf]);
+	nrf_pwm_seq_ptr_set(PWM_B, data_seq, (const uint16_t *)seq_b[shift_buf]);
 	nrf_pwm_event_clear(PWM_A, NRF_PWM_EVENT_STOPPED);
 	nrf_pwm_event_clear(PWM_B, NRF_PWM_EVENT_STOPPED);
 	nrf_pwm_task_trigger(PWM_A, NRF_PWM_TASK_SEQSTART0);
@@ -1370,7 +1689,7 @@ static void hub75_isr(const void *arg)
 	/* Both stopped, so OE is back on its GPIO level - high, blanked -
 	 * while the address changes and the new row latches. */
 	pins_clear(addr_all_mask);
-	pins_set(addr_mask(shift_row));
+	pins_set(addr_mask(shift_seq / depth));
 	/* Held for a microsecond - two back-to-back writes would make a pulse
 	 * of only a few tens of ns, which the wiring's capacitance can flatten
 	 * before the panel ever sees it. */
@@ -1381,10 +1700,12 @@ static void hub75_isr(const void *arg)
 	/* The next row was already rendered into the other pair while this
 	 * one was shifting - start it right away, then render the one after
 	 * it into the pair just freed up. */
-	shift_row = (shift_row + 1) % scan_rows;
+	uint16_t cycle = scan_rows * depth;
+
+	shift_seq = (shift_seq + 1) % cycle;
 	shift_buf ^= 1;
 	shift_start();
-	render_row(shift_buf ^ 1, (shift_row + 1) % scan_rows);
+	render_row(shift_buf ^ 1, (shift_seq + 1) % cycle);
 
 	/* Stopped again already: rendering took longer than shifting a row,
 	 * so this interrupt is due again the moment it returns - once is a
@@ -1399,13 +1720,25 @@ static void hub75_isr(const void *arg)
 	}
 }
 
+/* With every panel driven, one sequence per shift - the data - stopped by
+ * its own end (SEQEND0->STOP). Otherwise two, played back to back once
+ * (LOOP 1, LOOPSDONE->STOP): the filler first - it's shifted furthest,
+ * into the panels that aren't driven, keeping them blank - then the data,
+ * into the ones nearest the input. */
 static void pwm_setup(NRF_PWM_Type *pwm, const uint32_t pins[NRF_PWM_CHANNEL_COUNT],
-		      uint32_t idle_high, uint16_t top, const uint16_t *values)
+		      uint32_t idle_high, uint16_t top, const uint16_t *values,
+		      const uint16_t *filler)
 {
 	const nrf_pwm_sequence_t seq = {
 		.values.p_raw = values,
-		.length = (chain_len + IDLE_STEPS) * NRF_PWM_CHANNEL_COUNT,
+		.length = (drive_len + IDLE_STEPS) * NRF_PWM_CHANNEL_COUNT,
 		.repeats = 0,
+		.end_delay = 0,
+	};
+	const nrf_pwm_sequence_t fill = {
+		.values.p_raw = filler,
+		.length = NRF_PWM_CHANNEL_COUNT,
+		.repeats = chain_len - drive_len - 1,
 		.end_delay = 0,
 	};
 
@@ -1419,9 +1752,16 @@ static void pwm_setup(NRF_PWM_Type *pwm, const uint32_t pins[NRF_PWM_CHANNEL_COU
 	nrf_pwm_pins_set(pwm, pins);
 	nrf_pwm_configure(pwm, NRF_PWM_CLK_16MHz, NRF_PWM_MODE_UP, top);
 	nrf_pwm_decoder_set(pwm, NRF_PWM_LOAD_INDIVIDUAL, NRF_PWM_STEP_AUTO);
-	nrf_pwm_sequence_set(pwm, 0, &seq);
-	nrf_pwm_loop_set(pwm, 0);
-	nrf_pwm_shorts_set(pwm, NRF_PWM_SHORT_SEQEND0_STOP_MASK);
+	if (data_seq == 0) {
+		nrf_pwm_sequence_set(pwm, 0, &seq);
+		nrf_pwm_loop_set(pwm, 0);
+		nrf_pwm_shorts_set(pwm, NRF_PWM_SHORT_SEQEND0_STOP_MASK);
+	} else {
+		nrf_pwm_sequence_set(pwm, 0, &fill);
+		nrf_pwm_sequence_set(pwm, 1, &seq);
+		nrf_pwm_loop_set(pwm, 1);
+		nrf_pwm_shorts_set(pwm, NRF_PWM_SHORT_LOOPSDONE_STOP_MASK);
+	}
 	nrf_pwm_int_set(pwm, 0);
 	nrf_pwm_enable(pwm);
 }
@@ -1441,8 +1781,62 @@ static void pin_release(uint32_t pin)
 	}
 }
 
+static void hub75_free(void)
+{
+	frame = NULL;
+	drive_len = 0;
+}
+
+static size_t align8(size_t n)
+{
+	return (n + 7) & ~(size_t)7;
+}
+
+/* Every buffer of the config being started (`active`, its geometry
+ * worked out), laid out in hub75_arena - for all its panels if they fit,
+ * else for as many as do (the first ones along the chain; the rest stay
+ * blank, see pwm_setup()). False if not even one does. */
+static bool hub75_alloc(void)
+{
+	const size_t lut_bytes = 2 * align8(PAINT_LUT_LEN * sizeof(uint64_t));
+	const size_t pos_bytes = align8(row_blocks * active.width * sizeof(uint16_t));
+	const size_t cols_bytes = align8(active.width * sizeof(int16_t));
+
+	for (drive_panels = total_panels; drive_panels > 0; drive_panels--) {
+		drive_len = drive_panels * panel_w * row_blocks;
+
+		size_t seq_bytes = align8((drive_len + IDLE_STEPS) * sizeof(step_t));
+		size_t frame_bytes = align8((size_t)scan_rows * drive_len * depth);
+		size_t total = lut_bytes + 4 * seq_bytes + pos_bytes + cols_bytes + frame_bytes;
+		uint8_t *m = hub75_arena;
+
+		if (total > sizeof(hub75_arena)) {
+			continue;
+		}
+
+		paint_luts[0] = (uint64_t *)m;
+		paint_luts[1] = (uint64_t *)(m + lut_bytes / 2);
+		m += lut_bytes;
+		for (int i = 0; i < 2; i++) {
+			seq_a[i] = (step_t *)m;
+			m += seq_bytes;
+			seq_b[i] = (step_t *)m;
+			m += seq_bytes;
+		}
+		chain_pos = (uint16_t *)m;
+		m += pos_bytes;
+		map_cols = (int16_t *)m;
+		m += cols_bytes;
+		frame = m;
+		memset(frame, 0, frame_bytes);
+		return true;
+	}
+	drive_len = 0;
+	return false;
+}
+
 /* Lets the row being shifted finish, stops there, and releases every pin
- * (see pin_release()). */
+ * (see pin_release()) and buffer. */
 static void hub75_stop(void)
 {
 	static const uint32_t unconnected[NRF_PWM_CHANNEL_COUNT] = {
@@ -1483,6 +1877,7 @@ static void hub75_stop(void)
 		pin_release(addr_pins[i]);
 	}
 
+	hub75_free();
 	running = false;
 }
 
@@ -1566,7 +1961,9 @@ static void chip_init(void)
 	}
 }
 
-static void hub75_start(const struct hub75_config *c)
+/* False if there isn't the memory for even one of its panels - it stays
+ * off then, OE high. */
+static bool hub75_start(const struct hub75_config *c)
 {
 	active = *c;
 	scan_rows = c->scan;
@@ -1574,6 +1971,21 @@ static void hub75_start(const struct hub75_config *c)
 	panel_h = c->height / c->grid_y;
 	row_blocks = panel_h / 2 / c->scan;
 	chain_len = c->width * c->grid_y * row_blocks;
+	total_panels = c->grid_x * c->grid_y;
+	depth = c->depth;
+
+	stat_width = c->width;
+	stat_height = c->height;
+	stat_panels = total_panels;
+	if (!hub75_alloc()) {
+		error(TAG, "%uB not enough for one panel - disabled, try a lower depth",
+		      HUB75_ARENA_SIZE);
+		stat_state = STAT_NO_MEM;
+		return false;
+	}
+	stat_driven = drive_panels;
+	stat_state = drive_panels < total_panels ? STAT_LOW_MEM : STAT_OK;
+	data_seq = drive_panels < total_panels ? 1 : 0;
 
 	/* Even, so CLK can rise exactly halfway through. */
 	uint16_t top = (PWM_BASE_KHZ / c->clock_khz) & ~1;
@@ -1593,13 +2005,18 @@ static void hub75_start(const struct hub75_config *c)
 #undef LVL
 	}
 	for (size_t buf = 0; buf < 2; buf++) {
-		for (size_t i = chain_len; i < chain_len + IDLE_STEPS; i++) {
+		for (size_t i = drive_len; i < drive_len + IDLE_STEPS; i++) {
 			seq_a[buf][i][0] = STEP_WORD(PWM_LOW, PWM_LOW);
 			seq_a[buf][i][1] = STEP_WORD(PWM_LOW, PWM_LOW);
 			seq_b[buf][i][0] = STEP_WORD(PWM_LOW, PWM_LOW);
 			seq_b[buf][i][1] = STEP_WORD(PWM_LOW, PWM_HIGH);
 		}
 	}
+	/* Data off, CLK pulsing, OE blanked. */
+	filler_a[0] = STEP_WORD(PWM_LOW, PWM_LOW);
+	filler_a[1] = STEP_WORD(PWM_LOW, top / 2);
+	filler_b[0] = STEP_WORD(PWM_LOW, PWM_LOW);
+	filler_b[1] = STEP_WORD(PWM_LOW, PWM_HIGH);
 
 	addr_all_mask = 0;
 	pin_cfg_output(PIN_LAT, false);
@@ -1611,16 +2028,16 @@ static void hub75_start(const struct hub75_config *c)
 	chain_build();
 	chip_init();
 
-	/* Blank (all off) until hub75_task() draws the first frame into it,
-	 * right after this. */
-	memset(frame, 0, sizeof(frame));
+	/* Blank (all off, see hub75_alloc()) until hub75_task() draws the
+	 * first frame into it, right after this. */
 	render_row(0, 0);
-	render_row(1, 1 % scan_rows);
-	shift_row = 0;
+	render_row(1, 1 % (scan_rows * depth));
+	shift_seq = 0;
 	shift_buf = 0;
 
-	pwm_setup(PWM_A, pins_a, 0, top, (const uint16_t *)seq_a[0]);
-	pwm_setup(PWM_B, pins_b, BIT(PIN_OE), top, (const uint16_t *)seq_b[0]);
+	pwm_setup(PWM_A, pins_a, 0, top, (const uint16_t *)seq_a[0], (const uint16_t *)filler_a);
+	pwm_setup(PWM_B, pins_b, BIT(PIN_OE), top, (const uint16_t *)seq_b[0],
+		  (const uint16_t *)filler_b);
 
 	overruns = 0;
 	atomic_set(&hub75_overload, OVERLOAD_NONE);
@@ -1637,10 +2054,17 @@ static void hub75_start(const struct hub75_config *c)
 	irq_unlock(key);
 
 	running = true;
-	info(TAG, "running: %ux%u (%ux%u%s panels), 1/%u scan, %u-column chain, %s, %ukHz pixel "
-	     "clock, brightness %u/%u", c->width, c->height, c->grid_x, c->grid_y,
-	     c->serpentine ? " serpentine" : "", c->scan, chain_len, chip_name(c->chip),
-	     PWM_BASE_KHZ / top, c->brightness, HUB75_BRIGHTNESS_MAX);
+	if (drive_panels < total_panels) {
+		warn(TAG, "memory for %u of %u panels only", drive_panels, total_panels);
+	}
+	/* Every row address once per bit plane, each shift taking its
+	 * columns plus the idle steps at the pixel clock. */
+	uint32_t refresh_hz = (uint32_t)PWM_BASE_KHZ * 1000 / top /
+			      ((chain_len + IDLE_STEPS) * scan_rows * depth);
+
+	info(TAG, "%ux%u, %u/%u panels, 1/%u, %ukHz, %u bit, %uHz", c->width, c->height,
+	     drive_panels, total_panels, c->scan, PWM_BASE_KHZ / top, depth, refresh_hz);
+	return true;
 }
 
 static void hub75_task(void *p1, void *p2, void *p3)
@@ -1650,6 +2074,7 @@ static void hub75_task(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p3);
 
 	IRQ_CONNECT(DT_IRQN(PWM_A_NODE), PWM_A_IRQ_PRIORITY, hub75_isr, NULL, 0);
+
 
 	/* Blanked until the config says otherwise. */
 	pin_cfg_output(PIN_OE, true);
@@ -1680,6 +2105,7 @@ static void hub75_task(void *p1, void *p2, void *p3)
 			if (enabled) {
 				hub75_start(&config);
 			} else {
+				stat_state = STAT_DISABLED;
 				info(TAG, "disabled");
 			}
 			showing_nodem = false;
@@ -1701,9 +2127,7 @@ static void hub75_task(void *p1, void *p2, void *p3)
 		 * tripping (OVERLOAD_TRIPS within OVERLOAD_WINDOW_MS): then it
 		 * stays off until the config changes. */
 		if (overload != OVERLOAD_NONE && running) {
-			const char *why = overload == OVERLOAD_STUCK
-						  ? "PWM2 never stopped"
-						  : "rendering couldn't keep up with shifting";
+			const char *why = overload == OVERLOAD_STUCK ? "PWM2 stuck" : "overrun";
 
 			hub75_stop();
 			if (now - trip_window > OVERLOAD_WINDOW_MS) {
@@ -1712,14 +2136,12 @@ static void hub75_task(void *p1, void *p2, void *p3)
 			}
 			if (++trips >= OVERLOAD_TRIPS) {
 				restart_at = 0;
-				error(TAG, "%s %d times in %ds - panel stopped until the config "
-				      "changes (try a lower pixel clock or a shorter chain: %u columns "
-				      "at %ukHz now)",
-				      why, trips, OVERLOAD_WINDOW_MS / MSEC_PER_SEC, chain_len,
-				      PWM_BASE_KHZ / pwm_top);
+				stat_state = STAT_OVERLOAD;
+				error(TAG, "%s x%d - stopped until the config changes (lower the "
+				      "pixel clock)", why, trips);
 			} else {
 				restart_at = now + OVERLOAD_RESTART_MS;
-				warn(TAG, "%s - restarting the panel", why);
+				warn(TAG, "%s - restarting", why);
 			}
 		}
 		if (!running && restart_at && now >= restart_at) {
@@ -1749,7 +2171,6 @@ static void hub75_task(void *p1, void *p2, void *p3)
 					fx_frame++;
 					next_fx = now + FX_FRAME_MS;
 					animate = true;
-					fade_update();
 				}
 				wait_ms = next_fx - now;
 			}

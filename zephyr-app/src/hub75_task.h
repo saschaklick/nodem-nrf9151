@@ -1,6 +1,7 @@
 #ifndef HUB75_TASK_H_
 #define HUB75_TASK_H_
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "nodem_config.h"
@@ -54,9 +55,10 @@
  * the OLED shows.
  */
 
-/* Panels up to this many pixels (64x64, 128x32, ...) - every buffer is
- * sized for it once, so a new config never needs to allocate. */
-#define HUB75_MAX_PIXELS 4096
+/* A sanity limit on the display's size (64x256, 128x128, ...) - how much
+ * of it is actually driven depends on the memory there is, see
+ * hub75_task.c's hub75_alloc(). */
+#define HUB75_MAX_PIXELS 16384
 
 /* Brightness range: the share of each row's time it's lit for, out of this
  * (OE duty cycle, in PWM ticks - finer than 8 bits on every panel size). */
@@ -66,7 +68,7 @@
  * scan panel, input connector on the right, plain shift-register drivers,
  * red, at a low brightness (~1.6%). hub75_task.c's hub75_default() is the
  * same, parsed. */
-#define HUB75_DEFAULT "64:32:rt:1x1,8:n:500:shift,#ff0000,#000000,512"
+#define HUB75_DEFAULT "64:32:rt:1x1,8:n:500:shift:4,#ff0000,#000000,512"
 
 /*
  * Validates and persists config_store's "hub75" and has hub75_task apply it
@@ -88,7 +90,7 @@
  *   input. Two panels stacked, entering at the top right: "rt:1x2i".
  * - <protocol>: a preset - "4s", "8s", "8sf", "16s", "32s" (the number of
  *   row addresses; "8sf": chain "f") - or
- *   "<scan>:<chain>:<clock_khz>:<chip>", each part optional:
+ *   "<scan>:<chain>:<clock_khz>:<chip>:<depth>", each part optional:
  *   - <scan>: row addresses - 2 (A), 4 (A-B), 8 (A-C), 16 (A-D) or 32
  *     (A-E). On a panel with fewer row addresses than rows per half
  *     (labels like "8S" on a 32-row panel), each address's chain runs
@@ -103,27 +105,41 @@
  *   - <chip>: the column driver - "shift" (plain shift registers: ICN2037,
  *     ICN2038, MBI5124, DP5125, ...) or "fm6126a" (also "fm6124",
  *     "icn2038s"; set up with a register write before anything shows).
- *   Presets set every part (500 kHz, "shift").
+ *   - <depth>: bits per colour channel, 1-8 (2-256 levels each, 8 to 16.7
+ *     million colours). Each bit is one more shift of every row (a bit plane, lit
+ *     for its binary weight), so the refresh rate divides by it - 4 bits
+ *     on two 64x32 1/8 scan panels at 500 kHz is ~60 Hz; the CPU time
+ *     doesn't change (one render per shift either way).
+ *   Presets set every part (500 kHz, "shift", 4 bits).
  * - <color>/<off_color>: for lit/unlit pixels, "#rrggbb" (shorter is
  *   fine - missing digits are 0) or an effect, "<effect>[:<speed>]":
- *   "rainbow" (moving plasma), "stripes" (diagonal, scrolling - a barber
- *   pole), "wave" (horizontal bands waving like a flag), "scroll"
- *   (vertical bands sliding sideways), "cycle" (one colour stepping round
- *   the wheel), "fade" (the same, fading through black between colours -
- *   by dimming the whole panel, so a non-black other colour dims along),
- *   "fire" (flickering red/yellow/white rising from the
- *   bottom), "sparkle" (every pixel its own random colour, changing at
- *   random), "ripple" (rings spreading from the centre) or "gradient"
- *   (a still diagonal rainbow). <speed> (1-32, default per effect - not
- *   for "gradient") is how far it moves per frame, at 25 frames a second.
- *   Only on/off per channel for now - a channel is on wherever its value
- *   isn't 0, and effects move as bands of the fully saturated colours.
+ *   "plasma" (moving waves of colour, formerly "rainbow"), "stripes"
+ *   (diagonal, scrolling - a barber pole), "wave" (horizontal bands waving
+ *   like a flag), "scroll"
+ *   (vertical bands sliding sideways), "cycle" (one colour for the whole
+ *   panel, blending round the wheel), "fade" (each colour in turn, fading
+ *   in from black and out again), "fire" (flickering red/yellow/white
+ *   rising from the bottom), "sparkle" (every pixel twinkling - fading in and out in a
+ *   random colour, at its own time), "ripple" (rings spreading from the centre) or "gradient"
+ *   (a still diagonal rainbow). The full form is
+ *   "<effect>[:<speed>[:<palette>[:<scale>]]]", an empty part its
+ *   default: <speed> (1-32, default per effect - none for "gradient") is
+ *   how far it moves per frame, at 25 frames a second; <palette> (up to 8
+ *   of k r g y b m c w - black, red, green, yellow, blue, magenta, cyan,
+ *   white) the colours it blends between, in order and in equal shares,
+ *   as a loop - "fire": a ramp, coldest first - repeats allowed (default: the six colours of the wheel; for "fire" "kryw",
+ *   coldest to hottest; for "sparkle" the wheel and white); <scale> (1-32,
+ *   default 8) the pattern's size, larger stretching it. E.g.
+ *   "ripple:4:rb", "plasma::cg:16", "fire:::4".
+ *   "#rrggbb" and the effects' blends go through gamma 2 to <depth> bits
+ *   per channel - at depth 1, every blend is back to bands of the palette's
+ *   colours.
  * - <brightness>: 0-HUB75_BRIGHTNESS_MAX.
  *
  * Any field left empty (or missing at the end) takes HUB75_DEFAULT's. The
- * display must fit HUB75_MAX_PIXELS and each row address's chain 256
- * columns (width times rows of panels times the rows of a panel half
- * sharing an address). An empty value as a
+ * display must fit HUB75_MAX_PIXELS; as many of its panels as fit in the
+ * driver's memory are driven (the first ones along the chain), the rest
+ * stay blank - see the log. An empty value as a
  * whole disables the panel. Stored with every part spelled out, presets
  * expanded, so "#cfg" shows exactly what's in use. Returns 0 on success,
  * -EINVAL for a malformed value (nothing stored), or config_store's error
@@ -138,5 +154,15 @@ int hub75_config_set(const char *value);
  * panel is redrawn from it after every call.
  */
 void hub75_task_submit(const uint8_t *buf, const struct nodem_config *config);
+
+/*
+ * The "hub75" line of "#stat" (control.rs), shaped like nodem-esp32's
+ * "oled" one: "hub75,0,," while disabled, else "hub75,1,<w>x<h>,<status>" -
+ * status "ok", "low_mem <driven>/<configured> panels" (the memory was only
+ * enough for some, the rest stay blank), "no_mem" (not even for one) or
+ * "overload" (stopped after tripping too often - see hub75_task.c). No line
+ * break. snprintf semantics: returns the untruncated length.
+ */
+size_t hub75_stat_format(char *buf, size_t buf_len);
 
 #endif /* HUB75_TASK_H_ */

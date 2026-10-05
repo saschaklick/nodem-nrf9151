@@ -32,7 +32,10 @@ void nodem_log_write(const uint8_t *level_ptr, size_t level_len, const uint8_t *
 	printk("[%s] %.*s %.*s\n", TAG, (int)level_len, level_ptr, (int)msg_len, msg_ptr);
 }
 
-#define NODEM_STACK_SIZE 4096
+/* nodem-rs's Env is built here (nodem_runtime_new(), most of 4KB with the
+ * "vm" and "demo" features) - peak measured with CONFIG_INIT_STACKS at
+ * 4360 bytes after boot, page load and rendering; 4KB overflowed. */
+#define NODEM_STACK_SIZE 6144
 #define NODEM_PRIORITY   5
 #define NODEM_PERIOD_MS  17 /* ~60 Hz */
 

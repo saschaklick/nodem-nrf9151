@@ -17,6 +17,7 @@ unsafe extern "C" {
     fn config_get_str(key: *const c_char, buf: *mut c_char, buf_len: usize, default_val: *const c_char);
     fn display_oled_set(value: *const c_char) -> i32;
     fn hub75_config_set(value: *const c_char) -> i32;
+    fn hub75_stat_format(buf: *mut c_char, buf_len: usize) -> usize;
     fn nodem_config_set(value: *const c_char) -> i32;
     fn modem_stat_format(buf: *mut c_char, buf_len: usize) -> usize;
     fn modem_core_temp(temp_c: *mut i32) -> i32;
@@ -344,6 +345,16 @@ impl IControl for ZephyrControl {
                 let n = unsafe { modem_stat_format(buf.as_mut_ptr() as *mut c_char, buf.len()) };
                 let n = n.min(buf.len() - 1);
                 let _ = res.write_str(core::str::from_utf8(&buf[..n]).unwrap_or(""));
+
+                // "hub75,1,<w>x<h>,<status>" / "hub75,0,," - like
+                // nodem-esp32's "oled" line; see hub75_task.h's
+                // hub75_stat_format() for the statuses (e.g. "low_mem 1/2
+                // panels" when the memory only stretched to some of them).
+                let mut buf = [0u8; 64];
+                let n = unsafe { hub75_stat_format(buf.as_mut_ptr() as *mut c_char, buf.len()) };
+                let n = n.min(buf.len() - 1);
+                let _ = res.write_str(core::str::from_utf8(&buf[..n]).unwrap_or(""));
+                let _ = res.write_str("\r\n");
             }
             // "#oled,<protocol>:<width>:<height>:<x>:<y>[:<rotation>]" -
             // the OLED panel, e.g. the default "ssd1306:128:64:0:0"; an
@@ -364,7 +375,7 @@ impl IControl for ZephyrControl {
             }
             // "#hub75,<geometry>,<protocol>,<color>,<off_color>,<brightness>"
             // - the HUB75 LED matrix, e.g. the default
-            // "64:32:rt:1x1,8:n:500:shift,#ff0000,#000000,512"; empty fields keep
+            // "64:32:rt:1x1,8:n:500:shift:4,#ff0000,#000000,512"; empty fields keep
             // the default's, a bare "#hub75" disables it (and releases its
             // pins). See hub75_task.h's hub75_config_set() for the format -
             // it validates and stores it, and hub75_task.c restarts the
