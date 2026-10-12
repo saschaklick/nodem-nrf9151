@@ -12,6 +12,7 @@ use nodem_rs::media;
 use nodem_rs::runtime::{Runtime, Env, PKG_SYS};
 
 mod control;
+mod time;
 use control::ZephyrControl;
 
 // `nodem-rs` (`alloc` feature) needs a global allocator; since this staticlib
@@ -173,7 +174,10 @@ pub extern "C" fn nodem_runtime_new(fb_ptr: *mut u8, fb_len: usize, width: u16, 
     // stack and overflowed it at boot.
     let mut dom = Box::<Env>::new_uninit();
     dom.write(Env::new(fb, width, height));
-    Box::into_raw(unsafe { dom.assume_init() }) as *mut c_void
+    let mut dom = unsafe { dom.assume_init() };
+    dom.set_vm_interrupt(time::INDEX, Box::new(time::Time));
+    dom.vm_gate = Some(time::gate);
+    Box::into_raw(dom) as *mut c_void
 }
 
 /// Points `handle`'s `Surface` at `fb_ptr`/`fb_len`, a `width` x `height`

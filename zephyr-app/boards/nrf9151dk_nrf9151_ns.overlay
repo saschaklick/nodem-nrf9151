@@ -47,6 +47,15 @@
 	status = "okay";
 };
 
+/* The process_command UART's (see uart_task.c) interrupt above everything
+ * else: nRF's UARTE has next to no RX FIFO, and hub75_task.c's PWM interrupt
+ * (priority 1, the same level this had by default, so it couldn't be preempted)
+ * renders a whole row per run - long enough at full baud for the next bytes
+ * to be lost, which stalled every upload ("pkg"/"ota") of more than a few KB. */
+&uart0 {
+	interrupts = <8 0>;
+};
+
 / {
 	chosen {
 		zephyr,console = &uart1;

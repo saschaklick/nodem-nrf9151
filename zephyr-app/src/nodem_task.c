@@ -32,12 +32,22 @@ void nodem_log_write(const uint8_t *level_ptr, size_t level_len, const uint8_t *
 	printk("[%s] %.*s %.*s\n", TAG, (int)level_len, level_ptr, (int)msg_len, msg_ptr);
 }
 
-/* nodem-rs's Env is built here (nodem_runtime_new(), most of 4KB with the
- * "vm" and "demo" features) - peak measured with CONFIG_INIT_STACKS at
- * 4360 bytes after boot, page load and rendering; 4KB overflowed. */
-#define NODEM_STACK_SIZE 6144
+/* Uptime in ms for the Rust time interrupt (k_uptime_get() is a syscall
+ * wrapper, not directly linkable from Rust); wraps after ~49 days, the
+ * Rust side compares wrapping. */
+uint32_t nodem_uptime_ms(void)
+{
+	return (uint32_t)k_uptime_get();
+}
+
+uint32_t nodem_runtime_period_ms(void);
+
+/* nodem-rs's Env is built here (nodem_runtime_new()'s frame alone is ~5.9KB
+ * with the "vm" and "demo" features, the Env is assembled on the stack before
+ * it is moved into the heap) - 6KB overflowed with the time interrupt and
+ * the newer virtmach, 8KB leaves room for the rest of the task. */
+#define NODEM_STACK_SIZE 8192
 #define NODEM_PRIORITY   5
-#define NODEM_PERIOD_MS  17 /* ~60 Hz */
 
 /* Accumulates bytes pulled from uart_task's ring buffer across cycles.
  * nodem_process_command's underlying line parser only consumes as many
@@ -209,12 +219,14 @@ static void nodem_task(void *p1, void *p2, void *p3)
 	bool pkg_loaded = false;
 
 	while (true) {
-		int64_t deadline = k_uptime_get() + NODEM_PERIOD_MS;
+		/* The frame period is the program's time tick (time.rs),
+		 * 17 ms (~60 Hz) while it has set none. */
+		int64_t deadline = k_uptime_get() + nodem_runtime_period_ms();
 
 		/* Drains and processes UART/websocket traffic in a tight
 		 * loop until the next render is due, rather than just once
 		 * per render frame - a reply (e.g. a "pkg" upload's final
-		 * ack) used to wait out however much of NODEM_PERIOD_MS was
+		 * ack) used to wait out however much of the frame period was
 		 * left before this loop came back around to send it. Each
 		 * pass either finds new bytes and handles them immediately,
 		 * or - the common case - blocks on nodem_rx_sem, which wakes
@@ -223,6 +235,7 @@ static void nodem_task(void *p1, void *p2, void *p3)
 		for (;;) {
 			nodem_process_uart(runtime);
 			nodem_process_ws(runtime);
+			hub75_task_hold(nodem_loader_active(runtime));
 
 			/* Checked after every pass, not just once per render
 			 * frame - see nodem_process_uart()'s doc comment on

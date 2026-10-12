@@ -165,4 +165,11 @@ void hub75_task_submit(const uint8_t *buf, const struct nodem_config *config);
  */
 size_t hub75_stat_format(char *buf, size_t buf_len);
 
+/* Blanks the panel while `hold` is true and sets it up again from the config
+ * once it is false. nodem_task.c holds it during a "pkg"/"ota" upload: the
+ * PWM interrupt's row rendering overruns whenever the UART interrupt or a
+ * flash write preempts it, and after a few overruns the panel switches itself
+ * off until the config changes. */
+void hub75_task_hold(bool hold);
+
 #endif /* HUB75_TASK_H_ */

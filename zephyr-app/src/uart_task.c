@@ -33,7 +33,7 @@
 #define UART_NODE DT_NODELABEL(uart0)
 static const struct device *const uart_dev = DEVICE_DT_GET(UART_NODE);
 
-RING_BUF_DECLARE(uart_rx_ring, 1024);
+RING_BUF_DECLARE(uart_rx_ring, 2048);
 
 static void uart_isr(const struct device *dev, void *user_data)
 {

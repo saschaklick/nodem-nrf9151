@@ -2067,6 +2067,16 @@ static bool hub75_start(const struct hub75_config *c)
 	return true;
 }
 
+/* Set by hub75_task_hold(): the panel stays off until it is cleared again. */
+static atomic_t hub75_hold = ATOMIC_INIT(0);
+
+void hub75_task_hold(bool hold)
+{
+	if (atomic_set(&hub75_hold, hold) != hold) {
+		k_sem_give(&hub75_wake);
+	}
+}
+
 static void hub75_task(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
@@ -2091,9 +2101,26 @@ static void hub75_task(void *p1, void *p2, void *p3)
 	int64_t restart_at = 0;
 	int64_t trip_window = 0;
 	int trips = 0;
+	/* hub75_task_hold() seen: the panel is blanked and not (re)started. */
+	bool held = false;
 
 	while (true) {
-		if (atomic_get(&hub75_generation) != generation) {
+		bool hold = atomic_get(&hub75_hold);
+
+		if (hold != held) {
+			held = hold;
+			if (held) {
+				if (running) {
+					hub75_stop();
+				}
+				restart_at = 0;
+			} else {
+				/* Set up again from the config, as after any change of it. */
+				atomic_inc(&hub75_generation);
+			}
+		}
+
+		if (atomic_get(&hub75_generation) != generation && !held) {
 			generation = atomic_get(&hub75_generation);
 
 			struct hub75_config config;
