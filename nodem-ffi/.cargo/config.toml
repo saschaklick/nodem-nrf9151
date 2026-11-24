@@ -1,5 +1,6 @@
 [build]
 target = "thumbv8m.main-none-eabi"
+rustflags = "--cfg nodem_mode=\"rgb24\""
 
 [env]
 NODEM_ARCH = "NRF9151"

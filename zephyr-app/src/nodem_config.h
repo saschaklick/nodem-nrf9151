@@ -30,9 +30,34 @@
 
 #include <zephyr/sys/util.h>
 
-/* 1 bit/pixel, so e.g. 256x128 or 512x64 - bounded by RAM: nodem_task.c's
- * framebuffer and display_task.c's copy of it are both this size. */
+/* The pixel format nodem-rs was built with - its `nodem_mode` rustc cfg
+ * (nodem-ffi/.cargo/config.toml's rustflags), which CMakeLists.txt reads
+ * from there and passes on as NODEM_MODE_<MODE>=1, so both sides always
+ * agree. No mode means 1 bit/pixel indexed, the original format. Each mode
+ * packs a pixel the way nodem-rs's Color::from_rgb()/Surface::draw_pixel
+ * does - see nodem_fb_rgb(). */
+#if defined(NODEM_MODE_RGB332)
+#define NODEM_BPP 8
+#elif defined(NODEM_MODE_RGB444)
+#define NODEM_BPP 12
+#elif defined(NODEM_MODE_RGB555) || defined(NODEM_MODE_RGB565)
+#define NODEM_BPP 16
+#elif defined(NODEM_MODE_RGB666) || defined(NODEM_MODE_RGB24)
+#define NODEM_BPP 24
+#else
+#define NODEM_BPP 1
+#endif
+
+#define NODEM_COLOR (NODEM_BPP > 1)
+
+/* Bounded by RAM: nodem_task.c's framebuffer is this size (display_task.c
+ * and hub75_task.c read it in place). 1 bit/pixel: e.g. 256x128 or 512x64;
+ * colour: 128x64 at 24 bits/pixel. */
+#if NODEM_COLOR
+#define NODEM_FB_MAX_SIZE 24576
+#else
 #define NODEM_FB_MAX_SIZE 4096
+#endif
 
 struct nodem_mapping {
 	bool present;
@@ -72,6 +97,80 @@ static inline int16_t nodem_map_axis(int d, int size, int fb_size, int scale, in
 static inline uint32_t nodem_config_buffer_len(const struct nodem_config *c)
 {
 	return ((uint32_t)c->width * c->height * c->bits_per_pixel + 7) / 8;
+}
+
+static inline uint8_t nodem_expand(uint32_t v, int bits)
+{
+	/* Bit replication, so full scale maps to exactly 255. */
+	switch (bits) {
+	case 2:
+		return v * 85;
+	case 3:
+		return (v << 5) | (v << 2) | (v >> 1);
+	case 4:
+		return v * 17;
+	case 5:
+		return (v << 3) | (v >> 2);
+	case 6:
+		return (v << 2) | (v >> 4);
+	default:
+		return v;
+	}
+}
+
+/* Pixel `i` (row-major) of a framebuffer in the build's colour mode as
+ * 8-bit r, g, b. Only meaningful for NODEM_COLOR builds. */
+static inline void nodem_fb_rgb(const uint8_t *fb, uint32_t i, uint8_t rgb[3])
+{
+#if defined(NODEM_MODE_RGB332)
+	uint8_t v = fb[i];
+
+	rgb[0] = nodem_expand(v >> 5, 3);
+	rgb[1] = nodem_expand((v >> 2) & 7, 3);
+	rgb[2] = nodem_expand(v & 3, 2);
+#elif defined(NODEM_MODE_RGB444)
+	/* r, g, b nibbles one after the other, high nibble first. */
+	for (int c = 0; c < 3; c++) {
+		uint32_t n = i * 3 + c;
+		uint8_t v = fb[n >> 1];
+
+		rgb[c] = nodem_expand((n & 1) ? v & 0x0f : v >> 4, 4);
+	}
+#elif defined(NODEM_MODE_RGB555) || defined(NODEM_MODE_RGB565)
+	uint16_t v = fb[i * 2] | (fb[i * 2 + 1] << 8);
+#if defined(NODEM_MODE_RGB555)
+	rgb[0] = nodem_expand((v >> 10) & 31, 5);
+	rgb[1] = nodem_expand((v >> 5) & 31, 5);
+#else
+	rgb[0] = nodem_expand(v >> 11, 5);
+	rgb[1] = nodem_expand((v >> 5) & 63, 6);
+#endif
+	rgb[2] = nodem_expand(v & 31, 5);
+#elif defined(NODEM_MODE_RGB666)
+	for (int c = 0; c < 3; c++) {
+		rgb[c] = nodem_expand(fb[i * 3 + c] & 0x3f, 6);
+	}
+#elif defined(NODEM_MODE_RGB24)
+	for (int c = 0; c < 3; c++) {
+		rgb[c] = fb[i * 3 + c];
+	}
+#else
+	rgb[0] = rgb[1] = rgb[2] = 0;
+#endif
+}
+
+/* Pixel `i` as a lit/unlit dot - what a monochrome driver shows: the bit
+ * itself at 1 bit/pixel, else lit when its brightness is at least half. */
+static inline bool nodem_fb_lit(const uint8_t *fb, uint32_t i)
+{
+#if NODEM_COLOR
+	uint8_t rgb[3];
+
+	nodem_fb_rgb(fb, i, rgb);
+	return (rgb[0] * 77 + rgb[1] * 151 + rgb[2] * 28) >= 128 * 256;
+#else
+	return fb[i >> 3] & (0x80 >> (i & 7));
+#endif
 }
 
 /* Reads "nodem" back: a missing value (first boot) or an unparseable one is

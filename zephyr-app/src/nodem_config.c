@@ -14,7 +14,9 @@
 #define TAG "nodem_cfg"
 
 #define NODEM_KEY      "nodem"
-#define NODEM_DEFAULT  "128:64:1,oled:0:0:1:1"
+#define NODEM_STR_(x)  #x
+#define NODEM_STR(x)   NODEM_STR_(x)
+#define NODEM_DEFAULT  "128:64:" NODEM_STR(NODEM_BPP) ",oled:0:0:1:1"
 /* config_store's MAX_STR_LEN (127) + NUL. */
 #define NODEM_VALUE_LEN 128
 
@@ -123,7 +125,7 @@ static bool parse(const char *s, struct nodem_config *out)
 {
 	char entry[NODEM_VALUE_LEN];
 	const char *geometry;
-	long width, height, bpp;
+	long width, height, ignored;
 	struct nodem_config c = { 0 };
 
 	if (!next_field(&s, ',', entry, sizeof(entry))) {
@@ -133,13 +135,15 @@ static bool parse(const char *s, struct nodem_config *out)
 	geometry = entry;
 	if (!next_num(&geometry, 1, NODEM_MAX_DIMENSION, &width) ||
 	    !next_num(&geometry, 1, NODEM_MAX_DIMENSION, &height) ||
-	    !next_num(&geometry, 1, 1, &bpp) || geometry != NULL) {
+	    !next_num(&geometry, 0, INT16_MAX, &ignored) || geometry != NULL) {
 		return false;
 	}
 
 	c.width = (uint16_t)width;
 	c.height = (uint16_t)height;
-	c.bits_per_pixel = (uint8_t)bpp;
+	/* The depth field is only there for format compatibility - whatever it
+	 * says, the framebuffer is in the compiled-in nodem_mode's. */
+	c.bits_per_pixel = NODEM_BPP;
 
 	if (nodem_config_buffer_len(&c) > NODEM_FB_MAX_SIZE) {
 		return false;

@@ -29,6 +29,20 @@ generate_inc_file_for_target(
     ${modem_cert_gen_dir}/gts-root-r4.pem.inc
     )
 
+# The pixel format is nodem-rs's `nodem_mode` rustc cfg, set in nodem-ffi's
+# .cargo/config.toml - read it from there so the display drivers (nodem_config.h)
+# always unpack the framebuffer the way nodem-rs packed it.
+set(NODEM_CARGO_CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/../nodem-ffi/.cargo/config.toml)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${NODEM_CARGO_CONFIG})
+file(READ ${NODEM_CARGO_CONFIG} NODEM_CARGO_CONFIG_TEXT)
+if(NODEM_CARGO_CONFIG_TEXT MATCHES "nodem_mode=[^a-z0-9]*([a-z0-9]+)")
+  string(TOUPPER ${CMAKE_MATCH_1} NODEM_MODE)
+  message(STATUS "nodem_mode: ${CMAKE_MATCH_1}")
+  target_compile_definitions(app PRIVATE NODEM_MODE_${NODEM_MODE}=1)
+else()
+  message(STATUS "nodem_mode: none (1 bit/pixel)")
+endif()
+
 # `nodem-ffi` is built separately (`cargo build -p nodem-ffi --release --target
 # thumbv8m.main-none-eabihf`, driven by the top-level `cargo run` wrapper
 # before `west build` runs) - it isn't a CMake-built target, just a prebuilt

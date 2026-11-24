@@ -1579,20 +1579,35 @@ static bool frame_draw_nodem(bool force)
 				frame_row_set(&r, x, paint_at(&off, x, y));
 			}
 		} else {
-			/* Row-major, MSB first, no per-row padding - see
+			/* Row-major, no per-row padding - see
 			 * nodem_config_buffer_len(). */
 			uint32_t row_bit = (uint32_t)fy * fb_w;
 
 			for (int x = 0; x < w; x++) {
 				int fx = map_cols[x];
+#if NODEM_COLOR
+				/* The pixel's own colour (gamma-corrected like
+				 * every other), not the configured one - that
+				 * only paints what's off, outside the
+				 * framebuffer. */
+				if (fx >= 0) {
+					uint8_t c[3];
+
+					nodem_fb_rgb(nodem_fb, row_bit + fx, c);
+					frame_row_set(&r, x,
+						      spread(RGB24(gamma8(c[0]), gamma8(c[1]),
+								   gamma8(c[2]))));
+				} else {
+					frame_row_set(&r, x, paint_at(&off, x, y));
+				}
+#else
 				bool lit = false;
 
 				if (fx >= 0) {
-					uint32_t bit = row_bit + fx;
-
-					lit = nodem_fb[bit >> 3] & (0x80 >> (bit & 7));
+					lit = nodem_fb_lit(nodem_fb, row_bit + fx);
 				}
 				frame_row_set(&r, x, paint_at(lit ? &on : &off, x, y));
+#endif
 			}
 		}
 		display_fb_unlock();

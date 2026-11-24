@@ -626,7 +626,7 @@ static void build_page(uint8_t skip, uint8_t cols, int pg)
 			for (int i = 0; i < n; i++) {
 				uint32_t bit = (uint32_t)(col + rows[i]);
 
-				if (fb[bit >> 3] & (0x80 >> (bit & 7))) {
+				if (nodem_fb_lit(fb, bit)) {
 					byte |= row_mask[i];
 				}
 			}
