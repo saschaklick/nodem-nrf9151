@@ -50,14 +50,20 @@
 
 #define NODEM_COLOR (NODEM_BPP > 1)
 
-/* Bounded by RAM: nodem_task.c's framebuffer is this size (display_task.c
- * and hub75_task.c read it in place). 1 bit/pixel: e.g. 256x128 or 512x64;
- * colour: 128x64 at 24 bits/pixel. */
-#if NODEM_COLOR
-#define NODEM_FB_MAX_SIZE 24576
-#else
-#define NODEM_FB_MAX_SIZE 4096
-#endif
+/* nodem-rs is built with its "stencil" feature, so its framebuffer is
+ * nodem-rs's SCREEN_BUFFER_SIZE (128x64 pixels in the mode's format)
+ * followed by STENCIL_BUFFER_SIZE: one more bit per pixel, row-major, MSB
+ * first, set where something was drawn and clear where the pixel is
+ * transparent. The stencil's offset is that compile-time constant, not the
+ * runtime size's, so the framebuffer is always this big and a configured
+ * width x height can't have more than NODEM_SCREEN_PIXELS pixels. */
+#define NODEM_SCREEN_PIXELS 8192
+#define NODEM_STENCIL_OFFSET ((NODEM_SCREEN_PIXELS * NODEM_BPP + 7) / 8)
+#define NODEM_STENCIL_BYTES  ((NODEM_SCREEN_PIXELS + 7) / 8)
+
+/* nodem_task.c's framebuffer (display_task.c and hub75_task.c read it in
+ * place). */
+#define NODEM_FB_MAX_SIZE (NODEM_STENCIL_OFFSET + NODEM_STENCIL_BYTES)
 
 struct nodem_mapping {
 	bool present;
@@ -92,11 +98,13 @@ static inline int16_t nodem_map_axis(int d, int size, int fb_size, int scale, in
 	return (int16_t)CLAMP(shift + q, INT16_MIN, INT16_MAX);
 }
 
-/* Framebuffer size in bytes - pixels packed contiguously, row after row,
- * MSB first, no per-row padding (see nodem-rs's Surface::draw_pixel). */
+/* Framebuffer size in bytes, pixels and stencil - see NODEM_STENCIL_OFFSET;
+ * the same whatever the configured size. Pixels are packed contiguously,
+ * row after row, no per-row padding (see nodem-rs's Surface::draw_pixel). */
 static inline uint32_t nodem_config_buffer_len(const struct nodem_config *c)
 {
-	return ((uint32_t)c->width * c->height * c->bits_per_pixel + 7) / 8;
+	ARG_UNUSED(c);
+	return NODEM_FB_MAX_SIZE;
 }
 
 static inline uint8_t nodem_expand(uint32_t v, int bits)
@@ -159,17 +167,27 @@ static inline void nodem_fb_rgb(const uint8_t *fb, uint32_t i, uint8_t rgb[3])
 #endif
 }
 
+/* Whether pixel `i` was drawn (stencil bit set) rather than transparent. */
+static inline bool nodem_fb_opaque(const uint8_t *fb, uint32_t i)
+{
+	return fb[NODEM_STENCIL_OFFSET + (i >> 3)] & (0x80 >> (i & 7));
+}
+
 /* Pixel `i` as a lit/unlit dot - what a monochrome driver shows: the bit
- * itself at 1 bit/pixel, else lit when its brightness is at least half. */
+ * itself at 1 bit/pixel, else lit when its brightness is at least half.
+ * Transparent pixels are unlit. */
 static inline bool nodem_fb_lit(const uint8_t *fb, uint32_t i)
 {
 #if NODEM_COLOR
 	uint8_t rgb[3];
 
+	if (!nodem_fb_opaque(fb, i)) {
+		return false;
+	}
 	nodem_fb_rgb(fb, i, rgb);
 	return (rgb[0] * 77 + rgb[1] * 151 + rgb[2] * 28) >= 128 * 256;
 #else
-	return fb[i >> 3] & (0x80 >> (i & 7));
+	return nodem_fb_opaque(fb, i) && (fb[i >> 3] & (0x80 >> (i & 7)));
 #endif
 }
 

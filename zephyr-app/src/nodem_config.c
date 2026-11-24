@@ -21,7 +21,7 @@
 #define NODEM_VALUE_LEN 128
 
 /* Same upper bound as nodem-esp32's MAX_DIMENSION - on top of
- * NODEM_FB_MAX_SIZE, which is what actually limits it here. */
+ * the NODEM_SCREEN_PIXELS pixel limit, which is what actually limits it here. */
 #define NODEM_MAX_DIMENSION 1024
 #define NODEM_MAX_SCALE     16
 
@@ -145,7 +145,7 @@ static bool parse(const char *s, struct nodem_config *out)
 	 * says, the framebuffer is in the compiled-in nodem_mode's. */
 	c.bits_per_pixel = NODEM_BPP;
 
-	if (nodem_config_buffer_len(&c) > NODEM_FB_MAX_SIZE) {
+	if ((uint32_t)c.width * c.height > NODEM_SCREEN_PIXELS) {
 		return false;
 	}
 

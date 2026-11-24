@@ -19,7 +19,7 @@
 
 #define TAG "nodem"
 
-/* Sized for the largest framebuffer nodem_config.h allows - only the
+/* Pixels plus stencil, nodem_config.h's NODEM_FB_MAX_SIZE - only the
  * first nodem_config_buffer_len() bytes of it are in use at any time.
  * display_task.c reads it in place (see display_task_submit()), so every
  * write to it - each render, a resize - happens under display_fb_lock(). */

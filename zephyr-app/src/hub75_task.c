@@ -1588,9 +1588,9 @@ static bool frame_draw_nodem(bool force)
 #if NODEM_COLOR
 				/* The pixel's own colour (gamma-corrected like
 				 * every other), not the configured one - that
-				 * only paints what's off, outside the
-				 * framebuffer. */
-				if (fx >= 0) {
+				 * only paints what's off: outside the
+				 * framebuffer or transparent. */
+				if (fx >= 0 && nodem_fb_opaque(nodem_fb, row_bit + fx)) {
 					uint8_t c[3];
 
 					nodem_fb_rgb(nodem_fb, row_bit + fx, c);

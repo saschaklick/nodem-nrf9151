@@ -8,7 +8,7 @@ publish = false
 crate-type = ["staticlib"]
 
 [dependencies]
-nodem-rs = { git = "https://github.com/saschaklick/nodem-rs", features = ["base", "alloc", "runtime", "demo", "vm"] }
+nodem-rs = { git = "https://github.com/saschaklick/nodem-rs", features = ["base", "alloc", "runtime", "demo", "vm", "stencil"] }
 embedded-alloc = "0.6"
 critical-section = { version = "1.2", features = ["restore-state-u32"] }
 log = "0.4"
